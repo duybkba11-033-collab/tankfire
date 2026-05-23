@@ -1,0 +1,216 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TANKFIRE</title>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Teko:wght@400;600;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/src/styles.css">
+  </head>
+  <body>
+    <!-- Decorative animated background canvas (UI-only, does not affect game logic) -->
+    <canvas id="bg-canvas" aria-hidden="true"></canvas>
+
+    <div id="app" class="ui-shell">
+      <div id="auth">
+        <div class="auth-card">
+          <div class="auth-brand">
+            <h2 class="brand">TankFire</h2>
+            <div class="muted small">Fast, casual tank duels</div>
+          </div>
+          <div class="bullet-hole" style="top: 10px; left: 10px;"></div>
+  <div class="bullet-hole" style="bottom: 20px; right: 15px;"></div>
+
+          <div class="auth-forms">
+            <!-- Login form shown by default -->
+            <form id="login-form" class="auth-form" onsubmit="return false;">
+              <h3 class="form-title">Welcome back</h3>
+              <label class="sr-only" for="login-username">Username</label>
+              <input id="login-username" placeholder="Username" autocomplete="username" />
+              <label class="sr-only" for="login-password">Password</label>
+              <input id="login-password" type="password" placeholder="Password" autocomplete="current-password" />
+              <div class="form-actions">
+                <button id="btn-login" class="cta">Sign in</button>
+                <button id="btn-show-register" class="secondary" type="button">Register</button>
+              </div>
+            </form>
+
+            <!-- Register form exists in DOM but is hidden until requested -->
+            <form id="register-form" class="auth-form register-panel hidden" onsubmit="return false;">
+              <h3 class="form-title">Create an account</h3>
+              <label class="sr-only" for="reg-username">Username</label>
+              <input id="reg-username" placeholder="Choose a username" autocomplete="username" />
+              <label class="sr-only" for="reg-password">Password</label>
+              <input id="reg-password" type="password" placeholder="Choose a password" autocomplete="new-password" />
+              <div class="form-actions">
+                <button id="btn-register" class="cta">Create account</button>
+                <button id="btn-cancel-register" class="secondary" type="button">Back to login</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <div id="lobby" class="hidden ui-card">
+        <div class="top-row">
+            <div class="subtitle">Tanks Fire • Casual</div>
+          </div>
+        <div class="lobby-actions">
+          <button id="btn-find" class="cta">Find Match</button>
+          <button id="btn-history" class="secondary">Match History</button>
+          <button id="btn-ranking" class="secondary">Rank</button>
+        </div>
+        <div id="status" class="status muted"></div>
+      </div>
+
+      <div id="game" class="hidden game-shell">
+        <div class="game-stage">
+          <canvas id="game-canvas" width="800" height="600"></canvas>
+          <aside class="hud card"> <div id="info"></div> </aside>
+        </div>
+      </div>
+      <!-- Game over modal -->
+      <div id="game-over-modal" class="hidden">
+        <div class="gom-backdrop"></div>
+        <div class="gom-card">
+          <div class="gom-header">
+            <h2 id="gom-title">Game Over</h2>
+          </div>
+          <div class="gom-body">
+            <div id="gom-winner" class="gom-winner"></div>
+            <div id="gom-players" class="gom-players"></div>
+          </div>
+          <div class="gom-actions">
+            <button id="gom-return">Return to Lobby</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Match history panel -->
+      <div id="history-panel" class="hidden ui-card">
+        <div class="top-row"><h3>Match History</h3><div class="subtitle">Recent games</div></div>
+        <div class="table-wrap">
+          <table id="history-table">
+            <thead><tr><th>#</th><th>match_id</th><th>player1</th><th>player2</th><th>started_at</th><th>actions</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="history-detail" class="hidden detail-panel"></div>
+        <div class="panel-actions"><button id="history-close" class="secondary">Close</button></div>
+      </div>
+
+      <!-- Ranking panel -->
+      <div id="ranking-panel" class="hidden ui-card">
+        <div class="top-row"><h3>Ranking</h3><div class="subtitle">Leaderboard</div></div>
+        <div class="table-wrap">
+          <table id="ranking-table">
+            <thead><tr><th>#</th><th>username</th><th>total_score</th><th>played</th><th>won</th><th>win_rate</th><th>actions</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="ranking-detail" class="hidden detail-panel"></div>
+        <div class="panel-actions"><button id="ranking-close" class="secondary">Close</button></div>
+      </div>
+    </div>
+    </div>
+
+    <!-- Persistent top-right player header (stays visible while playing full-screen) -->
+    <div id="player-header" class="player-header hidden" role="region" aria-label="Player controls">
+      <div id="player-name" class="player-name"></div>
+      <button id="btn-logout-top" class="secondary">Logout</button>
+    </div>
+
+    <script>
+      // UI-only: toggle register panel visibility. Keeps all auth element IDs intact for existing logic.
+      (function(){
+        function q(id){return document.getElementById(id)}
+        document.addEventListener('DOMContentLoaded', ()=>{
+          const show = q('btn-show-register');
+          const cancel = q('btn-cancel-register');
+          const regPanel = q('register-form');
+          const loginForm = q('login-form');
+          if (show && regPanel && loginForm) {
+            show.addEventListener('click', ()=>{
+              regPanel.classList.remove('hidden');
+              loginForm.classList.add('hidden');
+            });
+          }
+          if (cancel && regPanel && loginForm) {
+            cancel.addEventListener('click', ()=>{
+              regPanel.classList.add('hidden');
+              loginForm.classList.remove('hidden');
+            });
+          }
+        });
+      })();
+    </script>
+    <script type="module" src="/src/main.js"></script>
+
+    <!-- UI-only background animation script: decorative animated particles on canvas. Does not change game logic -->
+    <script>
+  (function(){
+    const canvas = document.getElementById('bg-canvas');
+    const ctx = canvas.getContext && canvas.getContext('2d');
+    if (!ctx) return;
+    let w = 0, h = 0, particles = [];
+    function resize(){ w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
+    function rand(min,max){ return Math.random()*(max-min)+min }
+    
+    // Tạo 2 loại hạt: Tia lửa (Spark) và Khói (Smoke)
+    function make(){ 
+      particles = []; 
+      for(let i=0;i<100;i++){ 
+        const isSmoke = Math.random() > 0.6;
+        particles.push({ 
+          type: isSmoke ? 'smoke' : 'spark',
+          x: rand(0,w), 
+          y: rand(0,h), 
+          r: isSmoke ? rand(20, 80) : rand(1, 3), 
+          vx: rand(-0.5, 0.5), 
+          vy: isSmoke ? rand(-1, -0.2) : rand(-4, -1), // Lửa bay nhanh hơn khói
+          life: rand(0.5, 1)
+        });
+      } 
+    }
+    
+    function draw(){ 
+      // Nền đen/xám khói
+      ctx.fillStyle = 'rgba(10, 8, 8, 0.3)';
+      ctx.fillRect(0,0,w,h); 
+      
+      for(const p of particles){ 
+        ctx.beginPath(); 
+        if (p.type === 'spark') {
+          // Tia lửa màu cam/vàng
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+          ctx.fillStyle = `rgba(255, ${rand(100, 200)}, 0, ${p.life})`;
+          ctx.fill();
+        } else {
+          // Khói
+          const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+          g.addColorStop(0, `rgba(30, 25, 20, ${p.life * 0.15})`);
+          g.addColorStop(1, `rgba(10, 8, 8, 0)`);
+          ctx.fillStyle = g;
+          ctx.fillRect(p.x-p.r, p.y-p.r, p.r*2, p.r*2);
+        }
+        
+        p.x += p.vx; 
+        p.y += p.vy; 
+        p.life -= 0.002;
+        
+        // Reset khi bay khỏi màn hình hoặc hết life
+        if (p.y < -50 || p.life <= 0) {
+          p.y = h + 50;
+          p.x = rand(0, w);
+          p.life = rand(0.5, 1);
+        }
+      } 
+    }
+    function loop(){ draw(); requestAnimationFrame(loop); }
+    window.addEventListener('resize', ()=>{ resize(); make(); });
+    resize(); make(); loop();
+  })();
+</script>
+  </body>
+</html>
