@@ -1,4 +1,4 @@
-const API = 'http://10.103.4.70:3001/api';
+const API = `${window.location.protocol}//${window.location.hostname}:3001/api`;
 
 function setToken(token, user) {
   localStorage.setItem('tf_token', token);

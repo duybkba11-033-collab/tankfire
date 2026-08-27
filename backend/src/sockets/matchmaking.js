@@ -1,11 +1,23 @@
 const { Room } = require('../game/gameLoop');
+const MapClass = require('../models/Map');
+const MatchRecord = require('../models/MatchRecord');
+const RankingModel = require('../models/RankingModel');
+const map1 = require('../game/maps/map1');
+const map2 = require('../game/maps/map2');
+const map3 = require('../game/maps/map3');
 
 const queue = [];
 const rooms = new Map();
 
-function joinQueue(socket, user, io) {
-  // add to queue
-  queue.push({ socket, user });
+function joinQueue(socket, user, io, mapId) {
+  // ignore duplicate enqueue for the same socket
+  if (queue.find(q => q && q.socket && q.socket.id === socket.id)) {
+    console.log('joinQueue: socket already in queue', socket.id);
+    return;
+  }
+  // add to queue with selected mapId
+  queue.push({ socket, user, mapId });
+  console.log('joinQueue:', user.username, 'mapId=', mapId, 'queueLen=', queue.length);
   tryMatch(io);
 }
 
@@ -20,12 +32,62 @@ function tryMatch(io) {
 function createRoom(a, b, io) {
   const id = `room-${Date.now()}-${Math.floor(Math.random()*1000)}`;
   const room = new Room(id);
+  // determine map
+  const selMapId = a.mapId || b.mapId || 'map1';
+  let mapObj = { w:800, h:600, walls:[], grass:[], rivers:[] };
+  if (selMapId === 'map2') mapObj = map2;
+  else if (selMapId === 'map3') mapObj = map3;
+  else mapObj = map1;
+  room.map = new MapClass(mapObj);
+  // expand rectangular walls into tile bricks for per-tile damage
+  try { if (typeof room._expandWallsToTiles === 'function') room._expandWallsToTiles(32); } catch (e) { }
+  console.log('createRoom:', id, 'map=', room.map.id, 'players=', a.user.username, b.user.username);
   // store metadata so we can persist match history later
   rooms.set(id, { room, sockets: [a.socket, b.socket], interval: null, startedAt: Date.now(), matchId: id });
 
   // add players
   room.addPlayer(a.socket, a.user);
   room.addPlayer(b.socket, b.user);
+
+  // place the two players on opposite sides of the map
+  try {
+    const pA = room.players[a.socket.id];
+    const pB = room.players[b.socket.id];
+    // attempt to find a spawn for A and mirror for B
+    let placed = false;
+    for (let tries = 0; tries < 60 && !placed; tries++) {
+      const pos = room._randomSpawnPos();
+      const bboxA = { x: pos.x, y: pos.y, w: pA.w, h: pA.h };
+      if (room.isBlockedArea(bboxA)) continue;
+      // mirror position for B
+      const mirrorX = Math.max(0, Math.min(room.map.w - pB.w, room.map.w - pos.x - pB.w));
+      const mirrorY = Math.max(0, Math.min(room.map.h - pB.h, room.map.h - pos.y - pB.h));
+      const bboxB = { x: mirrorX, y: mirrorY, w: pB.w, h: pB.h };
+      if (!room.isBlockedArea(bboxB)) {
+        pA.x = bboxA.x; pA.y = bboxA.y;
+        pB.x = bboxB.x; pB.y = bboxB.y;
+        pA.bodyAngle = 0; pB.bodyAngle = 0;
+        placed = true;
+        break;
+      }
+      // try mirroring only X or only Y
+      const bboxBX = { x: mirrorX, y: pos.y, w: pB.w, h: pB.h };
+      const bboxBY = { x: pos.x, y: mirrorY, w: pB.w, h: pB.h };
+      if (!room.isBlockedArea(bboxBX)) {
+        pA.x = bboxA.x; pA.y = bboxA.y; pB.x = bboxBX.x; pB.y = bboxBX.y; pA.bodyAngle = 0; pB.bodyAngle = 0; placed = true; break;
+      }
+      if (!room.isBlockedArea(bboxBY)) {
+        pA.x = bboxA.x; pA.y = bboxA.y; pB.x = bboxBY.x; pB.y = bboxBY.y; pA.bodyAngle = 0; pB.bodyAngle = 0; placed = true; break;
+      }
+    }
+    if (!placed) {
+      // fallback to default respawn logic (may re-pick safe spots)
+      room.respawnPlayer(pA);
+      room.respawnPlayer(pB);
+    }
+  } catch (err) {
+    console.error('spawn opposite error', err);
+  }
 
   a.socket.join(id);
   b.socket.join(id);
@@ -44,12 +106,20 @@ function createRoom(a, b, io) {
   const tickMs = 1000/60;
   const interval = setInterval(()=>{
     room.update();
-    io.to(id).emit('state', room.getStateForBroadcast());
+    const meta = rooms.get(id) || {};
+    const socketsList = (meta.sockets || []).slice();
+    // emit per-socket personalized state so hidden players/actions are not revealed
+    for (const s of socketsList) {
+      try {
+        if (s && s.connected) s.emit('state', room.getStateForBroadcastFor(s.id));
+      } catch (err) { /* ignore per-socket emit errors */ }
+    }
     // check for game over
     if (room.gameOver) {
-      // emit final state and game_over
-      io.to(id).emit('state', room.getStateForBroadcast());
-      io.to(id).emit('game_over', room.gameOverWinner);
+      // emit final personalized state and game_over
+      for (const s of socketsList) {
+        try { if (s && s.connected) { s.emit('state', room.getStateForBroadcastFor(s.id)); s.emit('game_over', room.gameOverWinner); } } catch (err) {}
+      }
       // persist match history into DB (if pool available)
       try {
         const pool = require('../db');
@@ -69,31 +139,26 @@ function createRoom(a, b, io) {
         const score2 = p2 ? (typeof p2.finalScore === 'number' ? p2.finalScore : ( (p2.lives||0)*100 + Math.max(0, Math.floor(p2.hp||0)) )) : 0;
         const winner_name = room.gameOverWinner ? room.gameOverWinner.username : null;
         const matchId = meta.matchId || id;
-        // insert into match_history
-        pool.query('INSERT INTO match_history (match_id, player1_name, player2_name, winner_name, score1, score2, started_at, duration_sec) VALUES (?,?,?,?,?,?,?,?)', [matchId, player1_name, player2_name, winner_name, score1, score2, sAt, durationSec]).catch(err => console.error('persist match error', err));
-
-        // update ranking table for both players (upsert). Use userId available in player objects.
+        // insert into match_history via MatchRecord
         try {
-          // helper upsert SQL: increment totals if exists, otherwise insert
-          const upsertSql = `INSERT INTO ranking (user_id, username, total_score, matches_played, matches_won, last_played_at)
-            VALUES (?, ?, ?, 1, ?, ?)
-            ON DUPLICATE KEY UPDATE
-              username = VALUES(username),
-              total_score = total_score + VALUES(total_score),
-              matches_played = matches_played + 1,
-              matches_won = matches_won + VALUES(matches_won),
-              last_played_at = VALUES(last_played_at)`;
+          const rec = new MatchRecord({ matchId, player1_name, player2_name, winner_name, score1, score2, startedAt: sAt, durationSec });
+          rec.persist(pool).catch(err => console.error('persist match error', err));
+        } catch (err) {
+          console.error('persist match error', err);
+        }
 
-          // player 1
+        // update ranking table for both players using RankingModel
+        try {
           if (p1 && p1.userId) {
             const p1won = winner_name && String(winner_name) === String(player1_name) ? 1 : 0;
-            pool.query(upsertSql, [p1.userId, player1_name || ('user_'+p1.userId), score1 || 0, p1won, sAt]).catch(err => console.error('ranking upsert p1 error', err));
+            const r1 = new RankingModel({ userId: p1.userId, username: player1_name || ('user_'+p1.userId), totalScore: score1 || 0, matchesWon: p1won, lastPlayedAt: sAt });
+            r1.upsert(pool).catch(err => console.error('ranking upsert p1 error', err));
           }
 
-          // player 2 (may be null in some cases)
           if (p2 && p2.userId) {
             const p2won = winner_name && String(winner_name) === String(player2_name) ? 1 : 0;
-            pool.query(upsertSql, [p2.userId, player2_name || ('user_'+p2.userId), score2 || 0, p2won, sAt]).catch(err => console.error('ranking upsert p2 error', err));
+            const r2 = new RankingModel({ userId: p2.userId, username: player2_name || ('user_'+p2.userId), totalScore: score2 || 0, matchesWon: p2won, lastPlayedAt: sAt });
+            r2.upsert(pool).catch(err => console.error('ranking upsert p2 error', err));
           }
         } catch (err) {
           console.error('persist ranking error', err);

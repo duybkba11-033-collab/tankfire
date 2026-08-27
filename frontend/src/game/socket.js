@@ -8,8 +8,9 @@ let socket = null;
 let mouseCoords = { mouseX: 0, mouseY: 0 };
 
 export function initGame() {
-  window.addEventListener('find_match', () => {
-    connectAndFind();
+  window.addEventListener('find_match', (e) => {
+    const mapId = e && e.detail && e.detail.mapId ? e.detail.mapId : undefined;
+    connectAndFind(mapId);
   });
 
   // --- ĐOẠN THÊM VÀO: Lắng nghe di chuyển chuột trên Canvas ---
@@ -17,24 +18,31 @@ export function initGame() {
   if (canvas) {
     canvas.addEventListener('mousemove', (e) => {
       const rect = canvas.getBoundingClientRect();
-      // Tính toán tọa độ chuột tương đối so với Canvas
-      mouseCoords.mouseX = e.clientX - rect.left;
-      mouseCoords.mouseY = e.clientY - rect.top;
+      // Convert from CSS/display pixels to canvas internal coordinates
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      mouseCoords.mouseX = x * scaleX;
+      mouseCoords.mouseY = y * scaleY;
     });
   }
 }
 
-function connectAndFind() {
-  if (socket && socket.connected) {
-    socket.emit('find_match');
+function connectAndFind(mapId) {
+  // If a socket already exists, don't create another one. If connected, emit immediately.
+  if (socket) {
+    if (socket.connected) socket.emit('find_match', { mapId });
+    else console.log('connectAndFind: socket already exists, waiting for connect');
     return;
   }
   const token = getToken();
   if (!token) return alert('Not logged in');
-  socket = io('http://10.103.4.70:3001', { auth: { token } });
+  const SOCKET_SERVER = `${window.location.protocol}//${window.location.hostname}:3001`;
+  socket = io(SOCKET_SERVER, { auth: { token } });
 
   socket.on('connect_error', (err) => { alert('Socket error: ' + err.message); });
-  socket.on('connect', () => { console.log('connected', socket.id); socket.emit('find_match'); });
+  socket.on('connect', () => { console.log('connected', socket.id); socket.emit('find_match', { mapId }); });
 
   socket.on('matched', (data) => {
     // --- HIỆU ỨNG FLASH ---
@@ -63,6 +71,12 @@ function connectAndFind() {
   });
 
   socket.on('state', (state) => {
+    // ensure the local player is always visible to themselves
+    if (state && Array.isArray(state.players) && socket && socket.id) {
+      state.players.forEach(p => {
+        if (p.socketId === socket.id) p.hidden = false;
+      });
+    }
     renderState(state);
     if (state && state.gameOver) {
       showGameOverModal(state);

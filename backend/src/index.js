@@ -35,8 +35,9 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   console.log('socket connected', socket.id, socket.user.username);
-  socket.on('find_match', () => {
-    joinQueue(socket, socket.user, io);
+  socket.on('find_match', (data) => {
+    const mapId = data && data.mapId ? data.mapId : undefined;
+    joinQueue(socket, socket.user, io, mapId);
   });
   socket.on('input', (data) => {
     // forwarded in matchmaking room when matched

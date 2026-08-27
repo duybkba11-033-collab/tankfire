@@ -7,6 +7,6 @@ module.exports = {
     password: process.env.DB_PASS,
     database: process.env.DB_NAME,
   },
-  jwtSecret: process.env.JWT_SECRET,
+  jwtSecret: process.env.JWT_SECRET || process.env['JWT-SECRET'],
   port: process.env.PORT || 3001,
 };
