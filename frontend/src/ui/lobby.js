@@ -1,31 +1,32 @@
 import { getToken } from './login.js';
 
 export function initLobby() {
-  const btn = document.getElementById('btn-find');
+  const findButton = document.getElementById('btn-find');
+  const cancelButton = document.getElementById('btn-cancel-match');
   const status = document.getElementById('status');
 
-  // map selector UI (insert before status)
-  const mapSelContainer = document.createElement('div');
-  mapSelContainer.style.marginTop = '10px';
-  mapSelContainer.innerHTML = `
-    <label style="display:block;margin-bottom:6px;font-size:14px">Select map:</label>
-    <select id="map-select" style="padding:8px;border-radius:4px;background:rgba(0,0,0,0.4);color:var(--accent-2);">
-      <option value="map1">Ruined Outpost</option>
-      <option value="map2">River Crossing</option>
-      <option value="map3">Grasslands</option>
-    </select>
-  `;
-  if (status && status.parentNode) status.parentNode.insertBefore(mapSelContainer, status);
+  findButton.addEventListener('click', () => {
+    if (!getToken()) return;
+    const selectedMap = document.querySelector('input[name="map"]:checked');
+    window.dispatchEvent(
+      new CustomEvent('find_match', {
+        detail: { mapId: selectedMap ? selectedMap.value : 'map1' }
+      })
+    );
+  });
 
-  btn.onclick = async ()=>{
-    const token = getToken();
-    if (!token) return alert('Not logged in');
-    status.innerText = 'Searching for match...';
-    // get selected map id
-    const sel = document.getElementById('map-select');
-    const mapId = sel ? sel.value : 'map1';
-    // Create socket in socket module; emit event with map
-    const ev = new CustomEvent('find_match', { detail: { mapId } });
-    window.dispatchEvent(ev);
-  };
+  cancelButton.addEventListener('click', () => {
+    window.dispatchEvent(new Event('cancel_match'));
+  });
+
+  window.addEventListener('matchmaking_status', (event) => {
+    const { state, message } = event.detail;
+    const searching = state === 'QUEUED' || state === 'CONNECTING';
+    findButton.classList.toggle('hidden', searching);
+    cancelButton.classList.toggle('hidden', !searching || state === 'CONNECTING');
+    document.querySelectorAll('input[name="map"]').forEach((input) => {
+      input.disabled = searching;
+    });
+    status.textContent = message;
+  });
 }

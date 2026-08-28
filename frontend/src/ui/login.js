@@ -1,107 +1,105 @@
-const API = `${window.location.protocol}//${window.location.hostname}:3001/api`;
+import { apiRequest } from '../api.js';
+import { closeDataPanels, showPlayer, showView } from './view.js';
 
-function setToken(token, user) {
-  localStorage.setItem('tf_token', token);
-  localStorage.setItem('tf_user', JSON.stringify(user));
+const TOKEN_KEY = 'tf_token';
+const USER_KEY = 'tf_user';
+
+export function getToken() {
+  return localStorage.getItem(TOKEN_KEY);
 }
-
-function getToken() { return localStorage.getItem('tf_token'); }
 
 export function initUI() {
-  const regU = document.getElementById('reg-username');
-  const regP = document.getElementById('reg-password');
-  const btnReg = document.getElementById('btn-register');
-  const logU = document.getElementById('login-username');
-  const logP = document.getElementById('login-password');
-  const btnLogin = document.getElementById('btn-login');
-  const btnLogout = document.getElementById('btn-logout');
-  const topLogout = document.getElementById('btn-logout-top');
+  const loginForm = document.getElementById('login-form');
+  const registerForm = document.getElementById('register-form');
+  const loginFeedback = document.getElementById('login-feedback');
+  const registerFeedback = document.getElementById('register-feedback');
 
-  btnReg.onclick = async ()=>{
-    const res = await fetch(API + '/register', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username: regU.value, password: regP.value }) });
-    const j = await res.json();
-    if (res.ok) alert('Registered: '+j.username);
-    else alert(j.message || 'Error');
-  };
+  document.getElementById('btn-show-register').addEventListener('click', () => {
+    loginForm.classList.add('hidden');
+    registerForm.classList.remove('hidden');
+    registerFeedback.textContent = '';
+  });
+  document.getElementById('btn-cancel-register').addEventListener('click', () => {
+    registerForm.classList.add('hidden');
+    loginForm.classList.remove('hidden');
+    loginFeedback.textContent = '';
+  });
 
-  btnLogin.onclick = async ()=>{
-    const res = await fetch(API + '/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username: logU.value, password: logP.value }) });
-    const j = await res.json();
-    if (res.ok) {
-  setToken(j.token, j.user);
-  showLobby();
-  showPlayerHeader(j.user);
-    } else {
-      alert(j.message || 'Login failed');
+  registerForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = document.getElementById('btn-register');
+    button.disabled = true;
+    registerFeedback.className = 'feedback';
+    registerFeedback.textContent = 'Creating account...';
+    try {
+      const username = document.getElementById('reg-username').value.trim();
+      const password = document.getElementById('reg-password').value;
+      await apiRequest('/register', {
+        method: 'POST',
+        body: JSON.stringify({ username, password })
+      });
+      registerFeedback.classList.add('success');
+      registerFeedback.textContent = 'Account created. You can sign in now.';
+      document.getElementById('login-username').value = username;
+      document.getElementById('login-password').focus();
+      window.setTimeout(() => {
+        registerForm.classList.add('hidden');
+        loginForm.classList.remove('hidden');
+      }, 700);
+    } catch (error) {
+      registerFeedback.textContent = error.message;
+    } finally {
+      button.disabled = false;
     }
-  };
+  });
 
-  if (btnLogout) {
-    btnLogout.onclick = () => {
-      logout();
-    };
-  }
-
-  if (topLogout) {
-    topLogout.onclick = () => { logout(); };
-  }
-
-  // auto-login if token present
-  const tok = getToken();
-  if (tok) {
-    showLobby();
-    const me = JSON.parse(localStorage.getItem('tf_user')||'null');
-    if (me) {
-      showPlayerHeader(me);
+  loginForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = document.getElementById('btn-login');
+    button.disabled = true;
+    loginFeedback.textContent = 'Signing in...';
+    try {
+      const username = document.getElementById('login-username').value.trim();
+      const password = document.getElementById('login-password').value;
+      const result = await apiRequest('/login', {
+        method: 'POST',
+        body: JSON.stringify({ username, password })
+      });
+      localStorage.setItem(TOKEN_KEY, result.token);
+      localStorage.setItem(USER_KEY, JSON.stringify(result.user));
+      showPlayer(result.user);
+      showView('lobby');
+      loginFeedback.textContent = '';
+    } catch (error) {
+      loginFeedback.textContent = error.message;
+    } finally {
+      button.disabled = false;
     }
+  });
+
+  document.getElementById('btn-logout-top').addEventListener('click', logout);
+  window.addEventListener('auth_expired', () => logout(false));
+  const savedUser = readSavedUser();
+  if (getToken() && savedUser) {
+    showPlayer(savedUser);
+    showView('lobby');
+  } else {
+    logout(false);
   }
 }
 
-function showPlayerHeader(user){
+export function logout(notify = true) {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  closeDataPanels();
+  showView('auth');
+  if (notify) window.dispatchEvent(new Event('logout'));
+}
+
+function readSavedUser() {
   try {
-    const header = document.getElementById('player-header');
-    const nameEl = document.getElementById('player-name');
-    if (!header || !nameEl) return;
-    const uname = (user && user.username) ? user.username : (typeof user === 'string' ? user : 'Player');
-    nameEl.innerText = uname;
-    header.classList.remove('hidden');
-  } catch(e){ }
+    return JSON.parse(localStorage.getItem(USER_KEY));
+  } catch {
+    return null;
+  }
 }
-
-function hidePlayerHeader(){
-  try {
-    const header = document.getElementById('player-header');
-    const nameEl = document.getElementById('player-name');
-    if (!header) return;
-    header.classList.add('hidden');
-    if (nameEl) nameEl.innerText = '';
-  } catch(e){ }
-}
-
-function showLobby(){
-  document.getElementById('auth').classList.add('hidden');
-  document.getElementById('lobby').classList.remove('hidden');
-  // show header when in lobby and logged-in
-  const tok = getToken(); if (tok) { const me = JSON.parse(localStorage.getItem('tf_user')||'null'); if (me) showPlayerHeader(me); }
-}
-
-function showAuth(){
-  document.getElementById('auth').classList.remove('hidden');
-  document.getElementById('lobby').classList.add('hidden');
-  document.getElementById('game').classList.add('hidden');
-  // hide persistent header when at auth screen
-  hidePlayerHeader();
-}
-
-function logout(){
-  localStorage.removeItem('tf_token');
-  localStorage.removeItem('tf_user');
-  // notify other modules (socket) to cleanup
-  window.dispatchEvent(new Event('logout'));
-  hidePlayerHeader();
-  showAuth();
-}
-
-export { getToken };
-
-export { logout };

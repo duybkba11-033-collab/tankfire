@@ -1,156 +1,167 @@
-import { getToken } from '../ui/login.js';
-import { startInputCapture, setSendFn } from './input.js';
-import { renderState } from './render.js';
 import { io } from 'socket.io-client';
+import { API_URL } from '../config.js';
+import { getToken } from '../ui/login.js';
+import { showView } from '../ui/view.js';
+import { initInput, startInput, stopInput } from './input.js';
+import { createRenderer } from './render.js';
 
 let socket = null;
-// Biến lưu trữ tọa độ chuột hiện tại
-let mouseCoords = { mouseX: 0, mouseY: 0 };
+let renderer = null;
+let phase = 'IDLE';
+let pendingMapId = null;
+let currentMap = null;
+
+function setMatchmakingStatus(state, message) {
+  phase = state;
+  window.dispatchEvent(new CustomEvent('matchmaking_status', { detail: { state, message } }));
+}
 
 export function initGame() {
-  window.addEventListener('find_match', (e) => {
-    const mapId = e && e.detail && e.detail.mapId ? e.detail.mapId : undefined;
-    connectAndFind(mapId);
-  });
-
-  // --- ĐOẠN THÊM VÀO: Lắng nghe di chuyển chuột trên Canvas ---
   const canvas = document.getElementById('game-canvas');
-  if (canvas) {
-    canvas.addEventListener('mousemove', (e) => {
-      const rect = canvas.getBoundingClientRect();
-      // Convert from CSS/display pixels to canvas internal coordinates
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      mouseCoords.mouseX = x * scaleX;
-      mouseCoords.mouseY = y * scaleY;
-    });
-  }
+  renderer = createRenderer(canvas);
+  initInput(canvas);
+
+  window.addEventListener('find_match', (event) => findMatch(event.detail.mapId));
+  window.addEventListener('cancel_match', cancelMatch);
+  window.addEventListener('logout', disconnectSocket);
+  document.getElementById('gom-return').addEventListener('click', returnToLobby);
 }
 
-function connectAndFind(mapId) {
-  // If a socket already exists, don't create another one. If connected, emit immediately.
-  if (socket) {
-    if (socket.connected) socket.emit('find_match', { mapId });
-    else console.log('connectAndFind: socket already exists, waiting for connect');
+function findMatch(mapId) {
+  if (phase !== 'IDLE') return;
+  pendingMapId = mapId;
+  if (socket && socket.connected) {
+    socket.emit('find_match', { mapId });
+    setMatchmakingStatus('CONNECTING', 'Joining matchmaking...');
     return;
   }
+
   const token = getToken();
-  if (!token) return alert('Not logged in');
-  const SOCKET_SERVER = `${window.location.protocol}//${window.location.hostname}:3001`;
-  socket = io(SOCKET_SERVER, { auth: { token } });
-
-  socket.on('connect_error', (err) => { alert('Socket error: ' + err.message); });
-  socket.on('connect', () => { console.log('connected', socket.id); socket.emit('find_match', { mapId }); });
-
-  socket.on('matched', (data) => {
-    // --- HIỆU ỨNG FLASH ---
-    const flash = document.createElement('div');
-    flash.style.cssText = "position:fixed; inset:0; background:white; z-index:9999; transition:opacity 0.8s;";
-    document.body.appendChild(flash);
-    setTimeout(() => {
-      flash.style.opacity = "0";
-      setTimeout(() => flash.remove(), 800);
-    }, 100);
-
-    // --- LOGIC CHUYỂN CẢNH ---
-    const appEl = document.getElementById('app');
-    if (appEl) appEl.classList.add('only-game');
-
-    const lobbyEl = document.getElementById('lobby'); if (lobbyEl) lobbyEl.classList.add('hidden');
-    const gameEl = document.getElementById('game'); if (gameEl) gameEl.classList.remove('hidden');
-    const statusEl = document.getElementById('status'); if (statusEl) statusEl.innerText = 'Matched: ' + data.roomId;
-
-    // --- SỬA ĐỔI TẠI ĐÂY: Gửi kèm tọa độ chuột khi nhấn phím ---
-    startInputCapture((input) => {
-      // Gộp phím bấm (input) và tọa độ chuột (mouseCoords) để gửi lên server
-      const fullInput = { ...input, ...mouseCoords };
-      socket.emit('input', fullInput);
-    });
-  });
-
-  socket.on('state', (state) => {
-    // ensure the local player is always visible to themselves
-    if (state && Array.isArray(state.players) && socket && socket.id) {
-      state.players.forEach(p => {
-        if (p.socketId === socket.id) p.hidden = false;
-      });
-    }
-    renderState(state);
-    if (state && state.gameOver) {
-      showGameOverModal(state);
-    }
-  });
-
-  socket.on('game_over', (winner) => {
-    const state = { gameOver: true, winner, players: [] };
-    showGameOverModal(state);
-  });
-
-  let _modalShown = false;
-  function showGameOverModal(state) {
-    if (_modalShown) return;
-    _modalShown = true;
-    try { setSendFn(null); } catch (e) { }
-
-    const modal = document.getElementById('game-over-modal');
-    const winnerEl = document.getElementById('gom-winner');
-    const playersEl = document.getElementById('gom-players');
-    if (!modal || !winnerEl || !playersEl) return;
-
-    if (state.winner) {
-      winnerEl.innerText = `Winner: ${state.winner.username}`;
-    } else {
-      winnerEl.innerText = `No Winner`;
-    }
-
-    playersEl.innerHTML = '';
-    const players = (state.players || []).slice().sort((a, b) => (b.finalScore || 0) - (a.finalScore || 0));
-    players.forEach(p => {
-      const row = document.createElement('div');
-      row.className = 'gom-player' + ((state.winner && state.winner.userId === p.userId) ? ' winner' : '');
-      const name = document.createElement('div'); name.className = 'name'; name.innerText = p.username || p.userId || 'Player';
-      const score = document.createElement('div'); score.className = 'score'; score.innerText = String(typeof p.finalScore === 'number' ? p.finalScore : 0);
-      row.appendChild(name); row.appendChild(score);
-      playersEl.appendChild(row);
-    });
-
-    modal.classList.remove('hidden');
-
-    const ret = document.getElementById('gom-return');
-    if (ret) {
-      const onReturn = () => {
-        hideGameOverModal();
-        try { socket.disconnect(); } catch (e) { }
-        socket = null;
-        try { setSendFn(null); } catch (e) { }
-        const g = document.getElementById('game'); if (g) g.classList.add('hidden');
-        const l = document.getElementById('lobby'); if (l) l.classList.remove('hidden');
-        const appEl2 = document.getElementById('app'); if (appEl2) appEl2.classList.remove('only-game');
-        const status = document.getElementById('status'); if (status) status.innerText = state.winner ? `Winner: ${state.winner.username}` : 'Match ended';
-        ret.removeEventListener('click', onReturn);
-      };
-      ret.addEventListener('click', onReturn);
-    }
-  }
-
-  function hideGameOverModal() {
-    const modal = document.getElementById('game-over-modal');
-    if (modal) modal.classList.add('hidden');
-    _modalShown = false;
-  }
-
-  socket.on('disconnect', () => { console.log('disconnected'); });
+  if (!token) return;
+  setMatchmakingStatus('CONNECTING', 'Connecting to the game server...');
+  socket = io(API_URL, { auth: { token }, reconnectionAttempts: 3, timeout: 5000 });
+  bindSocketEvents(socket);
 }
 
-window.addEventListener('logout', () => {
-  if (socket) {
-    try { socket.disconnect(); } catch (e) { }
-    socket = null;
+function bindSocketEvents(client) {
+  client.on('connect', () => {
+    if (pendingMapId && (phase === 'CONNECTING' || phase === 'QUEUED')) {
+      client.emit('find_match', { mapId: pendingMapId });
+    }
+  });
+
+  client.on('connect_error', (error) => {
+    if (/token/i.test(error.message)) {
+      window.dispatchEvent(new Event('auth_expired'));
+    }
+    setMatchmakingStatus('IDLE', `Connection failed: ${error.message}`);
+    pendingMapId = null;
+  });
+
+  client.on('queue_joined', ({ position }) => {
+    setMatchmakingStatus('QUEUED', `Searching for an opponent. Queue position: ${position}`);
+  });
+
+  client.on('queue_cancelled', () => {
+    pendingMapId = null;
+    setMatchmakingStatus('IDLE', 'Search cancelled.');
+  });
+
+  client.on('matchmaking_error', ({ code }) => {
+    pendingMapId = null;
+    const message =
+      code === 'ALREADY_ACTIVE'
+        ? 'This account is already queued or playing in another tab.'
+        : 'That action is not available in the current state.';
+    setMatchmakingStatus('IDLE', message);
+  });
+
+  client.on('matched', (data) => {
+    pendingMapId = null;
+    phase = 'IN_GAME';
+    currentMap = data.map;
+    renderer.setLocalSocketId(data.yourSocketId);
+    renderer.start();
+    startInput((input) => {
+      renderer.recordInput(input);
+      client.emit('input', input);
+    });
+    document.getElementById('match-label').textContent = `${data.map.name} vs ${data.opponentName}`;
+    showView('game');
+  });
+
+  client.on('state', (state) => {
+    if (state.mapUpdate && currentMap) {
+      currentMap = {
+        ...currentMap,
+        revision: state.mapUpdate.revision,
+        walls: state.mapUpdate.walls
+      };
+    }
+    renderer.pushState({ ...state, map: currentMap });
+  });
+  client.on('game_over', showGameOver);
+
+  client.on('disconnect', (reason) => {
+    stopInput();
+    if (!getToken()) return;
+    if (phase === 'IN_GAME') {
+      renderer.stop();
+    }
+    pendingMapId = null;
+    showView('lobby');
+    setMatchmakingStatus('IDLE', `Disconnected: ${reason}`);
+  });
+}
+
+function cancelMatch() {
+  if (socket && socket.connected && phase === 'QUEUED') socket.emit('cancel_match');
+}
+
+function showGameOver(result) {
+  if (phase === 'RESULT') return;
+  phase = 'RESULT';
+  stopInput();
+  const reasonText = {
+    WIN: 'Victory by elimination',
+    ABORTED: 'Opponent disconnected',
+    DRAW: 'Match ended without a winner'
+  };
+  document.getElementById('gom-reason').textContent =
+    reasonText[result.endReason] || 'Match complete';
+  document.getElementById('gom-winner').textContent = result.winner
+    ? `${result.winner.username} wins the match.`
+    : 'No winner was recorded.';
+
+  const playersElement = document.getElementById('gom-players');
+  playersElement.replaceChildren();
+  const players = [...(result.players || [])].sort((a, b) => b.finalScore - a.finalScore);
+  for (const player of players) {
+    const row = document.createElement('div');
+    row.className = `result-player${result.winner?.userId === player.userId ? ' winner' : ''}`;
+    const name = document.createElement('span');
+    const score = document.createElement('strong');
+    name.textContent = player.username;
+    score.textContent = String(player.finalScore);
+    row.append(name, score);
+    playersElement.appendChild(row);
   }
-  try { setSendFn(null); } catch (e) { }
-  const g = document.getElementById('game'); if (g) g.classList.add('hidden');
-  const l = document.getElementById('lobby'); if (l) l.classList.remove('hidden');
-  const appEl3 = document.getElementById('app'); if (appEl3) appEl3.classList.remove('only-game');
-});
+  document.getElementById('game-over-modal').classList.remove('hidden');
+}
+
+function returnToLobby() {
+  document.getElementById('game-over-modal').classList.add('hidden');
+  renderer.stop();
+  showView('lobby');
+  setMatchmakingStatus('IDLE', 'Ready for another match.');
+}
+
+function disconnectSocket() {
+  stopInput();
+  renderer.stop();
+  pendingMapId = null;
+  currentMap = null;
+  phase = 'IDLE';
+  if (socket) socket.disconnect();
+  socket = null;
+}

@@ -1,39 +1,43 @@
--- Create users table for tankfire
 CREATE TABLE IF NOT EXISTS users (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  username VARCHAR(100) NOT NULL UNIQUE,
-  password VARCHAR(255) NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(20) NOT NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
 
--- Match history table
 CREATE TABLE IF NOT EXISTS match_history (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  match_id VARCHAR(50) NOT NULL UNIQUE,
-  player1_name VARCHAR(50),
-  player2_name VARCHAR(50),
-  winner_name VARCHAR(50),
-  score1 INT,
-  score2 INT,
-  started_at DATETIME,
-  duration_sec INT,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  match_id VARCHAR(64) NOT NULL UNIQUE,
+  player1_id INT UNSIGNED NOT NULL,
+  player2_id INT UNSIGNED NOT NULL,
+  winner_id INT UNSIGNED NULL,
+  player1_name VARCHAR(20) NOT NULL,
+  player2_name VARCHAR(20) NOT NULL,
+  winner_name VARCHAR(20) NULL,
+  end_reason ENUM('WIN', 'ABORTED', 'DRAW') NOT NULL,
+  score1 INT UNSIGNED NOT NULL DEFAULT 0,
+  score2 INT UNSIGNED NOT NULL DEFAULT 0,
+  started_at DATETIME NOT NULL,
+  ended_at DATETIME NOT NULL,
+  duration_sec INT UNSIGNED NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_match_started_at (started_at),
+  INDEX idx_match_player1 (player1_id),
+  INDEX idx_match_player2 (player2_id),
+  CONSTRAINT fk_match_player1 FOREIGN KEY (player1_id) REFERENCES users(id),
+  CONSTRAINT fk_match_player2 FOREIGN KEY (player2_id) REFERENCES users(id),
+  CONSTRAINT fk_match_winner FOREIGN KEY (winner_id) REFERENCES users(id)
+) ENGINE=InnoDB;
 
--- Ranking table: stores pre-aggregated leaderboard stats per user
 CREATE TABLE IF NOT EXISTS ranking (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  user_id INT NOT NULL,
-  username VARCHAR(100) NOT NULL,
-  total_score BIGINT DEFAULT 0,
-  matches_played INT DEFAULT 0,
-  matches_won INT DEFAULT 0,
-  -- win_rate: stored as decimal between 0 and 1 (matches_won / matches_played). When matches_played = 0 -> 0
-  win_rate DECIMAL(6,4) AS (CASE WHEN matches_played = 0 THEN 0 ELSE (matches_won / matches_played) END) STORED,
-  last_played_at DATETIME DEFAULT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY ux_ranking_user (user_id),
-  INDEX idx_total_score (total_score),
+  user_id INT UNSIGNED PRIMARY KEY,
+  username VARCHAR(20) NOT NULL,
+  rating INT NOT NULL DEFAULT 1000,
+  matches_played INT UNSIGNED NOT NULL DEFAULT 0,
+  matches_won INT UNSIGNED NOT NULL DEFAULT 0,
+  last_played_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_ranking_rating (rating DESC),
   CONSTRAINT fk_ranking_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-);
+) ENGINE=InnoDB;

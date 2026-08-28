@@ -1,478 +1,478 @@
-const { randomItem, Item } = require('./items');
-const { rectRect, circleRect } = require('./collision');
-const Player = require('../models/player');
-const MapClass = require('../models/Map');
+const { circleRect, rectRect } = require('./collision');
+const { calculateMovement, canOccupy } = require('../../../shared/movement.mjs');
+const { sanitizeInput } = require('./input');
+const {
+  ARMOR_PER_HIT,
+  ARMOR_PICKUP_AMOUNT,
+  BULLET_DAMAGE,
+  BULLET_RADIUS,
+  BULLET_SPEED,
+  ITEM_SPAWN_INTERVAL_MS,
+  ITEM_PICKUP_SIZE,
+  HEAL_AMOUNT,
+  MAX_ARMOR,
+  MAX_ITEMS,
+  MULTI_SHOT_DURATION_MS,
+  MULTI_SHOT_SPREAD_RADIANS,
+  PLAYER_LIVES,
+  RESPAWN_DELAY_MS,
+  RAPID_COOLDOWNS_MS,
+  SCORE_PER_LIFE,
+  SHIELD_DURATION_MS,
+  SHOT_COOLDOWN_MS,
+  SPAWN_MARGIN,
+  TANK_HP,
+  TANK_SIZE,
+  TANK_SPEED,
+  SPEED_BONUS_PER_LEVEL,
+  WALL_HIT_POINTS
+} = require('./constants');
 
+const ITEM_TYPES = ['heal', 'armor', 'speed', 'rapid', 'shield', 'multi_shot'];
+
+function cloneMap(map) {
+  const wallTiles = new Map();
+  for (const wall of map.walls || []) {
+    for (let x = wall.x; x < wall.x + wall.w; x += TANK_SIZE) {
+      for (let y = wall.y; y < wall.y + wall.h; y += TANK_SIZE) {
+        const tile = {
+          x,
+          y,
+          w: Math.min(TANK_SIZE, wall.x + wall.w - x),
+          h: Math.min(TANK_SIZE, wall.y + wall.h - y),
+          hp: WALL_HIT_POINTS
+        };
+        wallTiles.set(`${tile.x}:${tile.y}`, tile);
+      }
+    }
+  }
+  return {
+    id: map.id,
+    name: map.name,
+    w: map.w,
+    h: map.h,
+    walls: [...wallTiles.values()],
+    grass: (map.grass || []).map((area) => ({ ...area })),
+    rivers: (map.rivers || []).map((area) => ({ ...area }))
+  };
+}
+
+function createPlayer({ socketId, userId, username }) {
+  return {
+    socketId,
+    userId,
+    username,
+    connected: true,
+    x: 0,
+    y: 0,
+    w: TANK_SIZE,
+    h: TANK_SIZE,
+    bodyAngle: 0,
+    turretAngle: 0,
+    hp: TANK_HP,
+    armor: 0,
+    lives: PLAYER_LIVES,
+    eliminated: false,
+    respawning: false,
+    respawnAt: 0,
+    hidden: false,
+    shieldUntil: 0,
+    multiShotUntil: 0,
+    speedLevel: 0,
+    rapidLevel: 0,
+    lastShotAt: 0,
+    finalScore: 0,
+    input: sanitizeInput({}, { mouseX: 0, mouseY: 0, seq: -1 })
+  };
+}
 
 class Room {
-  constructor(id) {
+  constructor(id, map, { now = () => Date.now(), random = Math.random } = {}) {
     this.id = id;
-    this.players = {}; // socketId -> Player instance
+    this.map = cloneMap(map);
+    this.now = now;
+    this.random = random;
+    this.players = new Map();
     this.bullets = [];
     this.items = [];
-    this.map = new MapClass({ w: 800, h: 600, walls: [], grass: [], rivers: [] });
-    this.ticks = 0;
-    this.maxItems = 3;
-    this.spawnCounter = 0;
-
-    // gameplay constants
-    this.MAX_ARMOR = 100;
-    this.ARMOR_PER_BULLET = 10;
-    this.RESPAWN_DELAY_MS = 2000;
-    this.MAX_SPEED = 5;
-    
-    // rapid cooldowns per level: base 500ms, level1=400, level2=300, level3=250
-    this.RAPID_COOLDOWNS = [400, 300, 250];
-    
-    // temporary durations
-    this.SHIELD_DURATION_MS = 4000;
-    this.MULTI_DURATION_MS = 6000;
-    this.gameOverWinner = null;
+    this.mapRevision = 0;
+    this.nextItemId = 1;
+    this.itemSpawnElapsedMs = 0;
     this.gameOver = false;
+    this.endReason = null;
+    this.winner = null;
+    this.ticks = 0;
   }
 
-  // Expand rectangular walls into TILE-sized bricks with per-side damage counters
-  _expandWallsToTiles(tileSize = 32) {
-    if (!this.map || !Array.isArray(this.map.walls)) return;
-    const rects = this.map.walls.slice();
-    const tiles = [];
-    const seen = new Set();
-    for (const r of rects) {
-      const cols = Math.max(1, Math.round((r.w || tileSize) / tileSize));
-      const rows = Math.max(1, Math.round((r.h || tileSize) / tileSize));
-      for (let cx = 0; cx < cols; cx++) {
-        for (let cy = 0; cy < rows; cy++) {
-          const tx = (r.x || 0) + cx * tileSize;
-          const ty = (r.y || 0) + cy * tileSize;
-          const key = tx + ':' + ty;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          tiles.push({
-            x: tx, y: ty, w: tileSize, h: tileSize,
-            // sideDamage counts how many 1/3 slices removed from each side (0..maxSteps)
-            sideDamage: { left: 0, right: 0, top: 0, bottom: 0 },
-            maxSteps: 3
-          });
-        }
-      }
-    }
-    this.map.walls = tiles;
+  addPlayer(entry) {
+    if (this.players.has(entry.socketId)) return this.players.get(entry.socketId);
+    const player = createPlayer(entry);
+    this.players.set(entry.socketId, player);
+    this.respawnPlayer(player);
+    return player;
   }
 
-  // compute final scores when game ends
-  computeFinalScores() {
-    if (this.gameOver) {
-      for (const id in this.players) {
-        const p = this.players[id];
-        const lives = typeof p.lives === 'number' ? p.lives : 0;
-        const hp = typeof p.hp === 'number' ? Math.max(0, Math.floor(p.hp)) : 0;
-        p.finalScore = lives * 100 + hp;
-      }
-    } else {
-      for (const id in this.players) {
-        this.players[id].finalScore = 0;
+  placePlayersOpposite() {
+    const players = [...this.players.values()];
+    if (players.length !== 2) return;
+
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const first = this._randomSpawnPosition();
+      const second = {
+        x: this.map.w - first.x - TANK_SIZE,
+        y: this.map.h - first.y - TANK_SIZE
+      };
+      if (this._canOccupy(first.x, first.y) && this._canOccupy(second.x, second.y)) {
+        players[0].x = first.x;
+        players[0].y = first.y;
+        players[1].x = second.x;
+        players[1].y = second.y;
+        return;
       }
     }
   }
 
-  _randomSpawnPos() {
-    return {
-      x: Math.floor(50 + Math.random() * (this.map.w - 100)),
-      y: Math.floor(50 + Math.random() * (this.map.h - 100))
-    };
+  markDisconnected(socketId) {
+    const player = this.players.get(socketId);
+    if (!player) return;
+    player.connected = false;
+    player.input = sanitizeInput({}, player.input);
   }
 
-  isBlockedArea(bbox) {
-    // check walls and rivers (both block movement)
-    for (const w of (this.map.walls || [])) {
-      const sd = w.sideDamage || { left: 0, right: 0, top: 0, bottom: 0 };
-      const steps = w.maxSteps || 3;
-      const leftOff = (sd.left / steps) * w.w;
-      const rightOff = (sd.right / steps) * w.w;
-      const topOff = (sd.top / steps) * w.h;
-      const bottomOff = (sd.bottom / steps) * w.h;
-      const curW = w.w - leftOff - rightOff;
-      const curH = w.h - topOff - bottomOff;
-      if (curW > 0 && curH > 0) {
-        if (rectRect(bbox, { x: w.x + leftOff, y: w.y + topOff, w: curW, h: curH })) return true;
+  handleInput(socketId, payload) {
+    const player = this.players.get(socketId);
+    if (!player || !player.connected || this.gameOver) return false;
+    const next = sanitizeInput(payload, player.input);
+    if (next.seq <= player.input.seq) return false;
+    player.input = next;
+    return true;
+  }
+
+  update(deltaSeconds) {
+    if (this.gameOver) return;
+    this._evaluateDisconnects();
+    if (this.gameOver) return;
+
+    const now = this.now();
+    for (const player of this.players.values()) {
+      if (!player.connected || player.eliminated) continue;
+      if (player.respawning) {
+        if (now >= player.respawnAt) this.respawnPlayer(player);
+        else continue;
       }
+      this._updatePlayer(player, deltaSeconds);
+      if (player.input.shoot) this._spawnBullets(player, now);
     }
-    for (const r of (this.map.rivers || [])) {
-      if (rectRect(bbox, { x: r.x, y: r.y, w: r.w, h: r.h })) return true;
-    }
-    return false;
+
+    this._updateBullets(deltaSeconds);
+    this._updateItems(deltaSeconds);
+    this.ticks += 1;
   }
 
-  applyDamage(p, damage) {
-    if (!p || p.eliminated) return;
-    const now = Date.now();
-    if (p.shieldUntil && p.shieldUntil > now) return;
-
-    if (p.armor && p.armor > 0) {
-      const armorAbsorb = Math.min(p.armor, Math.min(this.ARMOR_PER_BULLET, damage));
-      p.armor = Math.max(0, p.armor - armorAbsorb);
-      const leftover = damage - armorAbsorb;
-      if (leftover > 0) p.hp -= leftover;
-    } else {
-      p.hp -= damage;
-    }
-
-    if (p.hp < 0) p.hp = 0;
-    if (p.hp <= 0) this.handleDeath(p);
-  }
-
-  handleDeath(p) {
-    if (p.lives > 1) {
-      p.lives -= 1;
-      p.tempDead = true;
-      p.respawnAt = Date.now() + this.RESPAWN_DELAY_MS;
-      p.hp = 0;
-      p.input = { up: false, down: false, left: false, right: false, shoot: false, mouseX: p.x, mouseY: p.y };
-    } else {
-      p.lives = 0;
-      p.eliminated = true;
-      p.tempDead = false;
-      p.hp = 0;
-      this.checkGameOver();
-    }
+  applyDamage(player, damage) {
+    if (!player || player.eliminated || player.respawning || damage <= 0) return;
+    if (player.shieldUntil > this.now()) return;
+    const absorbed = Math.min(player.armor, ARMOR_PER_HIT, damage);
+    player.armor -= absorbed;
+    player.hp = Math.max(0, player.hp - (damage - absorbed));
+    if (player.hp === 0) this._handleDeath(player);
   }
 
   checkGameOver() {
-    const nonEliminated = Object.values(this.players).filter(pp => !pp.eliminated);
-    if (!this.gameOver && nonEliminated.length <= 1) {
-      this.gameOver = true;
-      if (nonEliminated.length === 1) {
-        const w = nonEliminated[0];
-        this.gameOverWinner = { userId: w.userId, username: w.username };
-      } else {
-        this.gameOverWinner = null;
+    if (this.gameOver) return { reason: this.endReason, winner: this.winner };
+    const connected = [...this.players.values()].filter((player) => player.connected);
+    if (connected.length === 0 && this.players.size >= 2) return this._finish('DRAW', null);
+    if (connected.length === 1 && this.players.size >= 2)
+      return this._finish('ABORTED', connected[0]);
+    const alive = [...this.players.values()].filter((player) => !player.eliminated);
+    if (alive.length === 1 && this.players.size >= 2) return this._finish('WIN', alive[0]);
+    if (alive.length === 0 && this.players.size >= 2) return this._finish('DRAW', null);
+    return null;
+  }
+
+  respawnPlayer(player) {
+    player.respawning = false;
+    player.respawnAt = 0;
+    player.hp = TANK_HP;
+    player.armor = 0;
+    player.lastShotAt = 0;
+    player.speedLevel = 0;
+    player.rapidLevel = 0;
+    player.shieldUntil = 0;
+    player.multiShotUntil = 0;
+    player.input = sanitizeInput({}, player.input);
+
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const position = this._randomSpawnPosition();
+      if (this._canOccupy(position.x, position.y)) {
+        player.x = position.x;
+        player.y = position.y;
+        return;
       }
-      this.computeFinalScores();
     }
+    player.x = 0;
+    player.y = 0;
   }
 
-  respawnPlayer(p) {
-    if (!p) return;
-    p.tempDead = false;
-    p.respawnAt = 0;
-    p.hp = 100;
-    p.armor = 0;
-    p.lastShot = 0;
-    p.input = { up: false, down: false, left: false, right: false, shoot: false };
+  getMapSnapshot() {
+    return {
+      ...this.map,
+      revision: this.mapRevision,
+      walls: this.map.walls.map((wall) => ({ ...wall })),
+      grass: this.map.grass.map((area) => ({ ...area })),
+      rivers: this.map.rivers.map((area) => ({ ...area }))
+    };
+  }
 
-    // reset items
-    p.speedLevel = 0;
-    p.rapidLevel = 0;
-    p.speed = p.baseSpeed || 2.2;
-    p.shieldUntil = 0;
-    p.multiShotUntil = 0;
+  getStateFor(viewerSocketId, knownMapRevision = this.mapRevision) {
+    const now = this.now();
+    const visiblePlayers = [...this.players.values()]
+      .filter((player) => player.socketId === viewerSocketId || !player.hidden)
+      .map((player) => this._serializePlayer(player, now));
+    const visibleIds = new Set(visiblePlayers.map((player) => player.socketId));
+    return {
+      roomId: this.id,
+      serverTime: now,
+      tick: this.ticks,
+      mapUpdate:
+        knownMapRevision === this.mapRevision
+          ? null
+          : { revision: this.mapRevision, walls: this.map.walls.map((wall) => ({ ...wall })) },
+      players: visiblePlayers,
+      bullets: this.bullets
+        .filter((bullet) => bullet.owner === viewerSocketId || visibleIds.has(bullet.owner))
+        .map(({ x, y }) => ({ x, y })),
+      items: this.items.map((item) => ({ ...item })),
+      gameOver: this.gameOver,
+      endReason: this.endReason,
+      winner: this.winner
+    };
+  }
 
-    // pick a spawn position that is not inside walls/rivers; try several times
-    let attempts = 0;
-    let pos = this._randomSpawnPos();
-    while (this.isBlockedArea({ x: pos.x, y: pos.y, w: p.w, h: p.h }) && attempts < 50) {
-      pos = this._randomSpawnPos();
-      attempts++;
+  getParticipants() {
+    return [...this.players.values()].map((player) => ({
+      userId: player.userId,
+      username: player.username,
+      finalScore: player.finalScore
+    }));
+  }
+
+  _evaluateDisconnects() {
+    if ([...this.players.values()].some((player) => !player.connected)) this.checkGameOver();
+  }
+
+  _finish(reason, winner) {
+    this.gameOver = true;
+    this.endReason = reason;
+    this.winner = winner ? { userId: winner.userId, username: winner.username } : null;
+    for (const player of this.players.values()) {
+      player.finalScore =
+        Math.max(0, player.lives) * SCORE_PER_LIFE + Math.max(0, Math.round(player.hp));
     }
-    p.x = pos.x;
-    p.y = pos.y;
-    p.bodyAngle = 0;
-    p.turretAngle = 0;
+    return { reason, winner: this.winner };
   }
 
-  addPlayer(socket, user) {
-    this.players[socket.id] = new Player(socket.id, user);
-    // immediately place player at a valid spawn
-    this.respawnPlayer(this.players[socket.id]);
-  }
-
-  removePlayer(socketId) {
-    delete this.players[socketId];
+  _handleDeath(player) {
+    if (player.lives > 1) {
+      player.lives -= 1;
+      player.respawning = true;
+      player.respawnAt = this.now() + RESPAWN_DELAY_MS;
+      player.input = sanitizeInput({}, player.input);
+      return;
+    }
+    player.lives = 0;
+    player.eliminated = true;
     this.checkGameOver();
   }
 
-  handleInput(socketId, input) {
-    if (this.players[socketId]) {
-      // Merge new input with existing to preserve mouse coords if not sent every time
-      this.players[socketId].input = { ...this.players[socketId].input, ...input };
-      // debug log briefly
-      if (typeof input.up !== 'undefined' || typeof input.down !== 'undefined' || typeof input.left !== 'undefined' || typeof input.right !== 'undefined') {
-        // minimal logging
-        // console.log can be noisy; uncomment when debugging
-        // console.log('input from', socketId, input);
-      }
+  _updatePlayer(player, deltaSeconds) {
+    const speed = TANK_SPEED + player.speedLevel * SPEED_BONUS_PER_LEVEL;
+    const movement = calculateMovement(player.input, speed, deltaSeconds);
+    if (movement.angle !== null) player.bodyAngle = movement.angle;
+    if (Number.isFinite(player.input.mouseX) && Number.isFinite(player.input.mouseY)) {
+      player.turretAngle = Math.atan2(
+        player.input.mouseY - (player.y + player.h / 2),
+        player.input.mouseX - (player.x + player.w / 2)
+      );
     }
+    if (this._canOccupy(player.x + movement.dx, player.y)) player.x += movement.dx;
+    if (this._canOccupy(player.x, player.y + movement.dy)) player.y += movement.dy;
+    player.x = Math.min(this.map.w - player.w, Math.max(0, player.x));
+    player.y = Math.min(this.map.h - player.h, Math.max(0, player.y));
+    player.hidden = this.map.grass.some((area) => rectRect(player, area));
   }
 
-  spawnBullet(from) {
-    const p = this.players[from];
-    if (!p || p.tempDead || p.eliminated) return;
-    const now = Date.now();
-
-    let cooldown = 500;
-    if (p.rapidLevel && p.rapidLevel > 0) {
-      const idx = Math.min(p.rapidLevel - 1, this.RAPID_COOLDOWNS.length - 1);
-      cooldown = this.RAPID_COOLDOWNS[idx];
-    }
-
-    if (now - p.lastShot < cooldown) return;
-    p.lastShot = now;
-
-    const bSpeed = 7;
-    // Bắn theo hướng nòng súng (turretAngle)
-    const angle = p.turretAngle;
-
-    if (p.multiShotUntil && p.multiShotUntil > now) {
-      const angles = [angle - 0.2, angle, angle + 0.2];
-      for (const a of angles) {
-        this.bullets.push({ 
-          x: p.x + p.w / 2, y: p.y + p.h / 2, 
-          vx: Math.cos(a) * bSpeed, vy: Math.sin(a) * bSpeed, 
-          r: 4, owner: from, damage: 20 
-        });
-      }
-    } else {
-      this.bullets.push({ 
-        x: p.x + p.w / 2, y: p.y + p.h / 2, 
-        vx: Math.cos(angle) * bSpeed, vy: Math.sin(angle) * bSpeed, 
-        r: 4, owner: from, damage: 20 
+  _spawnBullets(player, now) {
+    const rapidIndex = Math.min(player.rapidLevel - 1, RAPID_COOLDOWNS_MS.length - 1);
+    const cooldown = player.rapidLevel > 0 ? RAPID_COOLDOWNS_MS[rapidIndex] : SHOT_COOLDOWN_MS;
+    if (now - player.lastShotAt < cooldown) return;
+    player.lastShotAt = now;
+    const angles =
+      player.multiShotUntil > now
+        ? [
+            player.turretAngle - MULTI_SHOT_SPREAD_RADIANS,
+            player.turretAngle,
+            player.turretAngle + MULTI_SHOT_SPREAD_RADIANS
+          ]
+        : [player.turretAngle];
+    for (const angle of angles) {
+      if (!Number.isFinite(angle)) continue;
+      this.bullets.push({
+        x: player.x + player.w / 2,
+        y: player.y + player.h / 2,
+        vx: Math.cos(angle) * BULLET_SPEED,
+        vy: Math.sin(angle) * BULLET_SPEED,
+        r: BULLET_RADIUS,
+        damage: BULLET_DAMAGE,
+        owner: player.socketId
       });
     }
   }
 
-  applyItemToPlayer(item, p) {
-    if (!p || p.eliminated || p.tempDead) return false;
+  _updateBullets(deltaSeconds) {
+    for (let index = this.bullets.length - 1; index >= 0; index -= 1) {
+      const bullet = this.bullets[index];
+      if (![bullet.x, bullet.y, bullet.vx, bullet.vy].every(Number.isFinite)) {
+        this.bullets.splice(index, 1);
+        continue;
+      }
+      bullet.x += bullet.vx * deltaSeconds;
+      bullet.y += bullet.vy * deltaSeconds;
+      if (
+        !Number.isFinite(bullet.x) ||
+        !Number.isFinite(bullet.y) ||
+        bullet.x < 0 ||
+        bullet.x > this.map.w ||
+        bullet.y < 0 ||
+        bullet.y > this.map.h
+      ) {
+        this.bullets.splice(index, 1);
+        continue;
+      }
+      const wallIndex = this.map.walls.findIndex((wall) => circleRect(bullet, wall));
+      if (wallIndex >= 0) {
+        this.map.walls[wallIndex].hp -= 1;
+        if (this.map.walls[wallIndex].hp <= 0) this.map.walls.splice(wallIndex, 1);
+        this.mapRevision += 1;
+        this.bullets.splice(index, 1);
+        continue;
+      }
+      const target = [...this.players.values()].find(
+        (player) =>
+          player.socketId !== bullet.owner &&
+          player.connected &&
+          !player.eliminated &&
+          !player.respawning &&
+          circleRect(bullet, player)
+      );
+      if (target) {
+        this.applyDamage(target, bullet.damage);
+        this.bullets.splice(index, 1);
+      }
+    }
+  }
 
+  _updateItems(deltaSeconds) {
+    this.itemSpawnElapsedMs += deltaSeconds * 1000;
+    if (this.items.length < MAX_ITEMS && this.itemSpawnElapsedMs >= ITEM_SPAWN_INTERVAL_MS) {
+      this.itemSpawnElapsedMs %= ITEM_SPAWN_INTERVAL_MS;
+      this._spawnItem();
+    }
+    for (let index = this.items.length - 1; index >= 0; index -= 1) {
+      const item = this.items[index];
+      const collector = [...this.players.values()].find(
+        (player) =>
+          player.connected &&
+          !player.eliminated &&
+          !player.respawning &&
+          rectRect(
+            {
+              x: item.x - ITEM_PICKUP_SIZE / 2,
+              y: item.y - ITEM_PICKUP_SIZE / 2,
+              w: ITEM_PICKUP_SIZE,
+              h: ITEM_PICKUP_SIZE
+            },
+            player
+          )
+      );
+      if (collector && this._applyItem(item, collector)) this.items.splice(index, 1);
+    }
+  }
+
+  _spawnItem() {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const position = this._randomSpawnPosition();
+      if (!this._canOccupy(position.x, position.y)) continue;
+      const type = ITEM_TYPES[Math.floor(this.random() * ITEM_TYPES.length)];
+      this.items.push({ id: `${this.id}-item-${this.nextItemId++}`, type, ...position });
+      return;
+    }
+  }
+
+  _applyItem(item, player) {
     switch (item.type) {
       case 'heal':
-        p.hp = Math.min(100, p.hp + 20);
-        return true;
+        player.hp = Math.min(TANK_HP, player.hp + HEAL_AMOUNT);
+        break;
       case 'armor':
-        p.armor = Math.min(this.MAX_ARMOR, (p.armor || 0) + 20);
-        return true;
+        player.armor = Math.min(MAX_ARMOR, player.armor + ARMOR_PICKUP_AMOUNT);
+        break;
       case 'speed':
-        p.speedLevel += 1;
-        p.speed = p.baseSpeed + (p.speedLevel * 0.5);
-        return true;
+        player.speedLevel += 1;
+        break;
       case 'rapid':
-        p.rapidLevel += 1;
-        return true;
+        player.rapidLevel += 1;
+        break;
       case 'shield':
-        p.shieldUntil = Date.now() + this.SHIELD_DURATION_MS;
-        return true;
+        player.shieldUntil = this.now() + SHIELD_DURATION_MS;
+        break;
       case 'multi_shot':
-        p.multiShotUntil = Date.now() + this.MULTI_DURATION_MS;
-        return true;
+        player.multiShotUntil = this.now() + MULTI_SHOT_DURATION_MS;
+        break;
       default:
         return false;
     }
+    return true;
   }
 
-  update() {
-    for (const id in this.players) {
-      const p = this.players[id];
-      const inp = p.input;
-      const now = Date.now();
-
-      if (p.tempDead && p.respawnAt && now >= p.respawnAt) {
-        this.respawnPlayer(p);
-      }
-
-      if (p.tempDead || p.eliminated) continue;
-
-      let dx = 0, dy = 0;
-      if (inp.up) dy -= p.speed;
-      if (inp.down) dy += p.speed;
-      if (inp.left) dx -= p.speed;
-      if (inp.right) dx += p.speed;
-
-      // Cập nhật góc thân xe (bodyAngle) theo hướng di chuyển
-      if (dx !== 0 || dy !== 0) {
-        p.bodyAngle = Math.atan2(dy, dx);
-      }
-
-      // Cập nhật góc tháp pháo (turretAngle) theo chuột
-      if (inp.mouseX !== undefined && inp.mouseY !== undefined) {
-        p.turretAngle = Math.atan2(inp.mouseY - (p.y + p.h / 2), inp.mouseX - (p.x + p.w / 2));
-      }
-
-      // collision with map: attempt move and rollback if collides with wall or river (rivers block movement)
-      const tryX = p.x + dx;
-      const tryY = p.y + dy;
-      const bbox = { x: tryX, y: tryY, w: p.w, h: p.h };
-      const blocked = this.isBlockedArea(bbox);
-      if (!blocked) { p.x = tryX; p.y = tryY; }
-
-      // Map bounds
-      p.x = Math.max(0, Math.min(this.map.w - p.w, p.x));
-      p.y = Math.max(0, Math.min(this.map.h - p.h, p.y));
-
-      // hidden flag when in grass
-      p.hidden = false;
-      for (const g of (this.map.grass||[])) {
-        if (rectRect({ x: p.x, y: p.y, w: p.w, h: p.h }, { x: g.x, y: g.y, w: g.w, h: g.h })) { p.hidden = true; break; }
-      }
-
-      if (inp.shoot) this.spawnBullet(id);
-    }
-
-    // update bullets
-    for (let i = this.bullets.length - 1; i >= 0; i--) {
-      const b = this.bullets[i];
-      b.x += b.vx;
-      b.y += b.vy;
-
-      if (b.x < 0 || b.x > this.map.w || b.y < 0 || b.y > this.map.h) {
-        this.bullets.splice(i, 1);
-        continue;
-      }
-
-      // check collision with wall tiles (directional damage)
-      let hitTile = false;
-      const walls = this.map.walls || [];
-      for (let wi = 0; wi < walls.length; wi++) {
-        const w = walls[wi];
-        const sd = w.sideDamage || { left: 0, right: 0, top: 0, bottom: 0 };
-        const steps = w.maxSteps || 3;
-        const leftOff = (sd.left / steps) * w.w;
-        const rightOff = (sd.right / steps) * w.w;
-        const topOff = (sd.top / steps) * w.h;
-        const bottomOff = (sd.bottom / steps) * w.h;
-        const curW = w.w - leftOff - rightOff;
-        const curH = w.h - topOff - bottomOff;
-        if (curW <= 0 || curH <= 0) continue; // already destroyed
-        const rect = { x: w.x + leftOff, y: w.y + topOff, w: curW, h: curH };
-        if (circleRect({ x: b.x, y: b.y, r: b.r }, rect)) {
-          // determine impact side from bullet velocity (vx,vy)
-          const vx = b.vx || 0; const vy = b.vy || 0;
-          let side;
-          if (Math.abs(vx) > Math.abs(vy)) side = vx > 0 ? 'left' : 'right';
-          else if (Math.abs(vy) > Math.abs(vx)) side = vy > 0 ? 'top' : 'bottom';
-          else {
-            // fallback: from center of tile to bullet
-            const cx = w.x + w.w / 2; const cy = w.y + w.h / 2;
-            const dx = b.x - cx; const dy = b.y - cy;
-            if (Math.abs(dx) > Math.abs(dy)) side = dx > 0 ? 'right' : 'left';
-            else side = dy > 0 ? 'bottom' : 'top';
-          }
-
-          w.sideDamage = w.sideDamage || { left: 0, right: 0, top: 0, bottom: 0 };
-          w.sideDamage[side] = Math.min(steps, (w.sideDamage[side] || 0) + 1);
-
-          // recompute remaining rect and remove tile if fully depleted
-          const l2 = (w.sideDamage.left / steps) * w.w;
-          const r2 = (w.sideDamage.right / steps) * w.w;
-          const t2 = (w.sideDamage.top / steps) * w.h;
-          const b2 = (w.sideDamage.bottom / steps) * w.h;
-          const remainW = w.w - l2 - r2;
-          const remainH = w.h - t2 - b2;
-          if (remainW <= 0 || remainH <= 0) {
-            // remove tile
-            this.map.walls.splice(wi, 1);
-          } else {
-            // store cached current rectangle for quick collision checks
-            w.cx = w.x + l2; w.cy = w.y + t2; w.cw = remainW; w.ch = remainH;
-          }
-
-          // bullet consumed
-          this.bullets.splice(i, 1);
-          hitTile = true;
-          break;
-        }
-      }
-      if (hitTile) continue;
-
-      // check collision with players
-      for (const pid in this.players) {
-        const p = this.players[pid];
-        if (pid === b.owner || p.tempDead || p.eliminated) continue;
-        if (circleRect({ x: b.x, y: b.y, r: b.r }, { x: p.x, y: p.y, w: p.w, h: p.h })) {
-          this.applyDamage(p, b.damage);
-          this.bullets.splice(i, 1);
-          break;
-        }
-      }
-    }
-
-    // item spawning
-    this.spawnCounter++;
-    if (this.spawnCounter % 200 === 0 && this.items.length < this.maxItems) {
-      this.items.push(Item.random(Date.now(), this.map.w, this.map.h));
-    }
-
-    // check items pickup
-      for (let i = this.items.length - 1; i >= 0; i--) {
-      const it = this.items[i];
-      for (const pid in this.players) {
-        const p = this.players[pid];
-        if (p.eliminated || p.tempDead) continue;
-        if (rectRect({ x: it.x - 8, y: it.y - 8, w: 16, h: 16 }, { x: p.x, y: p.y, w: p.w, h: p.h })) {
-          if (this.applyItemToPlayer(it, p)) {
-            this.items.splice(i, 1);
-            break;
-          }
-        }
-      }
-    }
-
-    this.ticks++;
+  _canOccupy(x, y) {
+    return canOccupy(this.map, { w: TANK_SIZE, h: TANK_SIZE }, x, y);
   }
 
-  getStateForBroadcast() {
-    const now = Date.now();
+  _randomSpawnPosition() {
     return {
-      map: this.map,
-      players: Object.values(this.players).map(p => ({
-        ...(typeof p.toBroadcast === 'function' ? p.toBroadcast(now) : {
-          socketId: p.socketId,
-          userId: p.userId,
-          username: p.username,
-          x: p.x, y: p.y,
-          w: p.w, h: p.h,
-          bodyAngle: p.bodyAngle || 0,
-          turretAngle: p.turretAngle || 0,
-          hp: p.hp,
-          armor: p.armor,
-          lives: p.lives,
-          dead: (!!p.tempDead || !!p.eliminated),
-          eliminated: !!p.eliminated,
-          speedLevel: p.speedLevel || 0,
-          rapidLevel: p.rapidLevel || 0,
-          shieldActive: !!(p.shieldUntil && p.shieldUntil > now),
-          multiShotActive: !!(p.multiShotUntil && p.multiShotUntil > now),
-          finalScore: p.finalScore || 0
-        })
-      })),
-      bullets: this.bullets.map(b => ({ x: b.x, y: b.y })),
-      items: this.items.map(it => (typeof it.toJSON === 'function' ? it.toJSON() : it)),
-      gameOver: !!this.gameOver,
-      winner: this.gameOverWinner || null
+      x: Math.floor(
+        SPAWN_MARGIN + this.random() * Math.max(1, this.map.w - TANK_SIZE - SPAWN_MARGIN * 2)
+      ),
+      y: Math.floor(
+        SPAWN_MARGIN + this.random() * Math.max(1, this.map.h - TANK_SIZE - SPAWN_MARGIN * 2)
+      )
     };
   }
 
-  // personalized broadcast: hide other players who are in grass (hidden) and hide their bullets
-  getStateForBroadcastFor(viewerSocketId) {
-    const now = Date.now();
-    const playersFor = Object.values(this.players).map(p => (typeof p.toBroadcast === 'function' ? p.toBroadcast(now) : p));
-    // filter out players that are hidden from this viewer (except the viewer themself)
-    const visiblePlayers = playersFor.filter(p => (p.socketId === viewerSocketId) || !p.hidden);
-
-    const bulletsFor = this.bullets.filter(b => {
-      // always show your own bullets
-      if (b.owner === viewerSocketId) return true;
-      // hide bullets from owners who are hidden
-      const owner = this.players[b.owner];
-      if (owner && owner.hidden) return false;
-      return true;
-    }).map(b => ({ x: b.x, y: b.y }));
-
+  _serializePlayer(player, now) {
     return {
-      map: this.map,
-      players: visiblePlayers,
-      bullets: bulletsFor,
-      items: this.items.map(it => (typeof it.toJSON === 'function' ? it.toJSON() : it)),
-      gameOver: !!this.gameOver,
-      winner: this.gameOverWinner || null
+      socketId: player.socketId,
+      userId: player.userId,
+      username: player.username,
+      x: player.x,
+      y: player.y,
+      w: player.w,
+      h: player.h,
+      bodyAngle: player.bodyAngle,
+      turretAngle: player.turretAngle,
+      hp: player.hp,
+      armor: player.armor,
+      lives: player.lives,
+      dead: player.respawning || player.eliminated,
+      eliminated: player.eliminated,
+      hidden: player.hidden,
+      shieldActive: player.shieldUntil > now,
+      multiShotActive: player.multiShotUntil > now,
+      speedLevel: player.speedLevel,
+      rapidLevel: player.rapidLevel,
+      lastProcessedSeq: player.input.seq,
+      finalScore: player.finalScore
     };
   }
 }

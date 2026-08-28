@@ -1,252 +1,297 @@
-const canvas = document.getElementById('game-canvas');
-const ctx = canvas.getContext('2d');
+import {
+  BULLET_RADIUS,
+  MAX_ARMOR,
+  SPEED_BONUS_PER_LEVEL,
+  TANK_HP,
+  TANK_SIZE,
+  TANK_SPEED,
+  WALL_HIT_POINTS
+} from './constants.js';
+import { calculateMovement, canOccupy } from '../../../shared/movement.mjs';
 
-function drawTank(p) {
-    const tankColor = p.dead ? '#555' : '#2ecc71'; // Màu xanh cho xe tăng
-    const turretColor = p.dead ? '#444' : '#27ae60';
-
-    ctx.save();
-  if (p.hidden) ctx.globalAlpha = 0.35;
-    ctx.translate(p.x + 16, p.y + 16);
-
-    // 1. Vẽ bóng đổ (Shadow)
-    ctx.save();
-    ctx.rotate(p.bodyAngle);
-    ctx.fillStyle = 'rgba(0,0,0,0.2)';
-    ctx.fillRect(-14, -14, 32, 32);
-    ctx.restore();
-
-    // 2. Vẽ thân xe & Xích (Chassis) quay theo hướng di chuyển
-    ctx.save();
-    ctx.rotate(p.bodyAngle);
-    // Xích xe
-    ctx.fillStyle = '#333';
-    ctx.fillRect(-18, -16, 36, 8); // Xích trái
-    ctx.fillRect(-18, 8, 36, 8);  // Xích phải
-    // Thân chính
-    ctx.fillStyle = tankColor;
-    ctx.fillRect(-14, -12, 28, 24);
-    ctx.strokeStyle = '#111';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(-14, -12, 28, 24);
-    ctx.restore();
-
-    // 3. Vẽ tháp pháo & Nòng súng quay theo chuột
-    ctx.save();
-    ctx.rotate(p.turretAngle);
-    // Nòng súng
-    ctx.fillStyle = '#7f8c8d';
-    ctx.fillRect(0, -3, 22, 6);
-    ctx.strokeRect(0, -3, 22, 6);
-    // Tháp pháo (hình tròn)
-    ctx.fillStyle = turretColor;
-    ctx.beginPath();
-    ctx.arc(0, 0, 10, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
-
-    ctx.restore();
+function interpolateState(previous, current, alpha) {
+  if (!previous || previous.roomId !== current.roomId) return current;
+  const previousPlayers = new Map(previous.players.map((player) => [player.socketId, player]));
+  return {
+    ...current,
+    players: current.players.map((player) => {
+      const before = previousPlayers.get(player.socketId);
+      if (!before) return player;
+      return {
+        ...player,
+        x: before.x + (player.x - before.x) * alpha,
+        y: before.y + (player.y - before.y) * alpha,
+        bodyAngle: player.bodyAngle,
+        turretAngle: player.turretAngle
+      };
+    })
+  };
 }
 
-export function renderState(state) {
-  if (!ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+export function createRenderer(canvas) {
+  const context = canvas.getContext('2d');
+  let localSocketId = null;
+  let previous = null;
+  let current = null;
+  let receivedAt = 0;
+  let snapshotInterval = 1000 / 30;
+  let animationId = null;
+  let latestInput = null;
+  let pendingInputs = [];
 
-  // draw map (walls, grass, rivers) if provided
-  const map = state.map || { walls: [], grass: [], rivers: [] };
-  // rivers (blue)
-  (map.rivers || []).forEach(r => {
-    const grad = ctx.createLinearGradient(r.x, r.y, r.x + r.w, r.y + r.h);
-    grad.addColorStop(0, '#2e86de'); grad.addColorStop(1, '#1b4f72');
-    ctx.fillStyle = grad; ctx.fillRect(r.x, r.y, r.w, r.h);
-    // subtle waves
-    ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 1;
-    for (let i = 0; i < 6; i++) {
-      const yy = r.y + (i + 0.5) * (r.h / 6);
-      ctx.beginPath(); ctx.moveTo(r.x, yy); ctx.quadraticCurveTo(r.x + r.w/4, yy + 4 * Math.sin(i + Date.now()*0.001), r.x + r.w, yy); ctx.stroke();
+  function pushState(state) {
+    const now = performance.now();
+    if (receivedAt) snapshotInterval = Math.min(100, Math.max(16, now - receivedAt));
+    previous = current;
+    current = state;
+    receivedAt = now;
+    const localPlayer = state.players.find((player) => player.socketId === localSocketId);
+    if (localPlayer) {
+      pendingInputs = pendingInputs.filter((input) => input.seq > localPlayer.lastProcessedSeq);
     }
-  });
-  // grass (green)
-  (map.grass || []).forEach(g => {
-    const grad = ctx.createLinearGradient(g.x, g.y, g.x, g.y + g.h);
-    grad.addColorStop(0, '#3cb371'); grad.addColorStop(1, '#2e8b57');
-    ctx.fillStyle = grad; ctx.fillRect(g.x, g.y, g.w, g.h);
-    // draw simple blades pattern
-    ctx.strokeStyle = 'rgba(0,0,0,0.08)'; ctx.lineWidth = 1;
-    for (let i = 0; i < 6; i++) {
-      const bx = g.x + 6 + i * (g.w / 6);
-      ctx.beginPath(); ctx.moveTo(bx, g.y + g.h); ctx.lineTo(bx - 3, g.y + g.h - 12); ctx.stroke();
+  }
+
+  function frame(now) {
+    if (current) {
+      const alpha = Math.min(1, Math.max(0, (now - receivedAt) / snapshotInterval));
+      const interpolated = interpolateState(previous, current, alpha);
+      const predicted = predictLocalPlayer(
+        interpolated,
+        localSocketId,
+        pendingInputs.at(-1) || latestInput,
+        Math.min(0.1, Math.max(0, now - receivedAt) / 1000)
+      );
+      drawScene(context, canvas, predicted, localSocketId);
     }
-  });
-  // walls (brown bricks)
-  (map.walls || []).forEach(w => {
-    const sd = w.sideDamage || { left: 0, right: 0, top: 0, bottom: 0 };
-    const steps = w.maxSteps || 3;
-    const leftOff = (sd.left / steps) * w.w;
-    const rightOff = (sd.right / steps) * w.w;
-    const topOff = (sd.top / steps) * w.h;
-    const bottomOff = (sd.bottom / steps) * w.h;
-    const drawW = Math.max(0, w.w - leftOff - rightOff);
-    const drawH = Math.max(0, w.h - topOff - bottomOff);
-    if (drawW <= 0 || drawH <= 0) return;
-    const drawX = w.x + leftOff;
-    const drawY = w.y + topOff;
-    const destructible = typeof w.sideDamage === 'object';
-    ctx.fillStyle = destructible ? '#8b4513' : '#c0c0c0';
-    ctx.fillRect(drawX, drawY, drawW, drawH);
-    ctx.strokeStyle = destructible ? '#642f10' : '#888'; ctx.lineWidth = 1; ctx.strokeRect(drawX, drawY, drawW, drawH);
+    animationId = requestAnimationFrame(frame);
+  }
 
-    if (destructible) {
-      ctx.strokeStyle = 'rgba(0,0,0,0.08)';
-      const brickH = 10;
-      for (let by = drawY; by < drawY + drawH; by += brickH) {
-        ctx.beginPath(); ctx.moveTo(drawX, by); ctx.lineTo(drawX + drawW, by); ctx.stroke();
-      }
-      // subtle crack when partially damaged
-      if ((sd.left || sd.right || sd.top || sd.bottom) && (sd.left + sd.right + sd.top + sd.bottom > 0)) {
-        ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 2;
-        ctx.beginPath();
-        const cx = drawX + drawW / 2; const cy = drawY + drawH / 2;
-        ctx.moveTo(drawX + 2, cy - 4); ctx.lineTo(cx, cy + 4); ctx.lineTo(drawX + drawW - 2, cy - 2); ctx.stroke();
-      }
+  return {
+    start() {
+      if (animationId === null) animationId = requestAnimationFrame(frame);
+    },
+    stop() {
+      if (animationId !== null) cancelAnimationFrame(animationId);
+      animationId = null;
+      previous = null;
+      current = null;
+      latestInput = null;
+      pendingInputs = [];
+      context.clearRect(0, 0, canvas.width, canvas.height);
+    },
+    pushState,
+    recordInput(input) {
+      latestInput = input;
+      pendingInputs.push(input);
+      if (pendingInputs.length > 120) pendingInputs.shift();
+    },
+    setLocalSocketId(socketId) {
+      localSocketId = socketId;
     }
-  });
+  };
+}
 
-  // Vẽ Items (giữ nguyên logic cũ nhưng làm đẹp màu sắc)
-  // nicer item icons with subtle gradients and shadows
-  const tNow = Date.now() / 1000;
-  (state.items || []).forEach(it => {
-    const cx = it.x;
-    const cy = it.y;
-    const pulse = 1 + 0.06 * Math.sin(tNow * 4 + (it.x + it.y) * 0.01);
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.shadowColor = 'rgba(0,0,0,0.35)';
-    ctx.shadowBlur = 6;
+function predictLocalPlayer(state, localSocketId, input, deltaSeconds) {
+  if (!input || !state.map || deltaSeconds <= 0) return state;
+  const playerIndex = state.players.findIndex((player) => player.socketId === localSocketId);
+  if (playerIndex < 0) return state;
+  const player = state.players[playerIndex];
+  if (player.dead || player.eliminated) return state;
 
-    function drawHeart() {
-      const g = ctx.createLinearGradient(-8, -8, 8, 12);
-      g.addColorStop(0, '#ff6b6b'); g.addColorStop(1, '#e74c3c');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.moveTo(0, 6 * pulse);
-      ctx.bezierCurveTo(8, -6, 22, 2, 0, 22);
-      ctx.bezierCurveTo(-22, 2, -8, -6, 0, 6 * pulse);
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(0,0,0,0.2)'; ctx.lineWidth = 1; ctx.stroke();
+  const speed = TANK_SPEED + (player.speedLevel || 0) * SPEED_BONUS_PER_LEVEL;
+  const movement = calculateMovement(input, speed, deltaSeconds);
+  if (movement.angle === null) return state;
+  const predicted = { ...player, bodyAngle: movement.angle };
+  if (canOccupy(state.map, predicted, predicted.x + movement.dx, predicted.y))
+    predicted.x += movement.dx;
+  if (canOccupy(state.map, predicted, predicted.x, predicted.y + movement.dy))
+    predicted.y += movement.dy;
+
+  const players = state.players.slice();
+  players[playerIndex] = predicted;
+  return { ...state, players };
+}
+
+function drawScene(context, canvas, state, localSocketId) {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = '#182019';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  drawGrid(context, canvas);
+  drawMap(context, state.map || {});
+  for (const item of state.items || []) drawItem(context, item);
+  for (const bullet of state.bullets || []) drawBullet(context, bullet);
+  for (const player of state.players || [])
+    drawTank(context, player, player.socketId === localSocketId);
+}
+
+function drawGrid(context, canvas) {
+  context.strokeStyle = 'rgba(255,255,255,0.025)';
+  context.lineWidth = 1;
+  for (let x = 0; x <= canvas.width; x += TANK_SIZE) {
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, canvas.height);
+    context.stroke();
+  }
+  for (let y = 0; y <= canvas.height; y += TANK_SIZE) {
+    context.beginPath();
+    context.moveTo(0, y);
+    context.lineTo(canvas.width, y);
+    context.stroke();
+  }
+}
+
+function drawMap(context, map) {
+  for (const river of map.rivers || []) {
+    const gradient = context.createLinearGradient(river.x, river.y, river.x, river.y + river.h);
+    gradient.addColorStop(0, '#287c8e');
+    gradient.addColorStop(1, '#174d63');
+    context.fillStyle = gradient;
+    context.fillRect(river.x, river.y, river.w, river.h);
+    context.strokeStyle = 'rgba(195,240,255,0.2)';
+    for (let y = river.y + 10; y < river.y + river.h; y += 16) {
+      context.beginPath();
+      context.moveTo(river.x, y);
+      context.lineTo(river.x + river.w, y);
+      context.stroke();
     }
+  }
 
-    function drawShieldIcon() {
-      const g = ctx.createLinearGradient(-10, -14, 10, 18);
-      g.addColorStop(0, '#5dade2'); g.addColorStop(1, '#2e86c1');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.moveTo(0, -12);
-      ctx.quadraticCurveTo(12, -6, 8, 14);
-      ctx.quadraticCurveTo(0, 20, -8, 14);
-      ctx.quadraticCurveTo(-12, -6, 0, -12);
-      ctx.closePath(); ctx.fill();
-      ctx.strokeStyle = 'rgba(0,0,0,0.18)'; ctx.lineWidth = 1; ctx.stroke();
-      // emblem
-      ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.font = '10px Arial'; ctx.textAlign = 'center'; ctx.fillText('S', 0, 4);
+  for (const grass of map.grass || []) {
+    context.fillStyle = 'rgba(48, 112, 63, 0.72)';
+    context.fillRect(grass.x, grass.y, grass.w, grass.h);
+    context.strokeStyle = 'rgba(146, 199, 111, 0.35)';
+    for (let x = grass.x + 8; x < grass.x + grass.w; x += 14) {
+      context.beginPath();
+      context.moveTo(x, grass.y + grass.h);
+      context.lineTo(x + 4, grass.y + grass.h - 12);
+      context.stroke();
     }
+  }
 
-    function drawLightning() {
-      ctx.fillStyle = '#f1a9ff';
-      ctx.beginPath();
-      ctx.moveTo(-6, -10);
-      ctx.lineTo(2, -10);
-      ctx.lineTo(-2, 0);
-      ctx.lineTo(6, 0);
-      ctx.lineTo(-2, 14);
-      ctx.lineTo(2, 2);
-      ctx.lineTo(-6, 2);
-      ctx.closePath(); ctx.fill();
-      ctx.strokeStyle = 'rgba(0,0,0,0.12)'; ctx.lineWidth = 1; ctx.stroke();
+  for (const wall of map.walls || []) {
+    const health = Math.max(0, Math.min(WALL_HIT_POINTS, wall.hp || WALL_HIT_POINTS));
+    context.fillStyle =
+      health === WALL_HIT_POINTS
+        ? '#8e5d38'
+        : health === WALL_HIT_POINTS - 1
+          ? '#785038'
+          : '#62453a';
+    context.fillRect(wall.x, wall.y, wall.w, wall.h);
+    context.strokeStyle = '#3b2a22';
+    context.strokeRect(wall.x + 0.5, wall.y + 0.5, wall.w - 1, wall.h - 1);
+    context.strokeStyle = 'rgba(255,255,255,0.1)';
+    for (let y = wall.y + 10; y < wall.y + wall.h; y += 10) {
+      context.beginPath();
+      context.moveTo(wall.x, y);
+      context.lineTo(wall.x + wall.w, y);
+      context.stroke();
     }
+  }
+}
 
-    function drawBullet() {
-      // body gradient
-      const g = ctx.createLinearGradient(-8, 0, 8, 0);
-      g.addColorStop(0, '#ffd39f'); g.addColorStop(1, '#e67e22');
-      ctx.fillStyle = g;
-      ctx.beginPath(); ctx.ellipse(-2, 0, 6, 4, 0, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(10, -4); ctx.lineTo(10, 4); ctx.closePath(); ctx.fill();
-      // motion lines
-      ctx.strokeStyle = 'rgba(255,200,150,0.6)'; ctx.lineWidth = 1.2;
-      ctx.beginPath(); ctx.moveTo(12, -6); ctx.lineTo(18, -6); ctx.moveTo(12, 6); ctx.lineTo(18, 6); ctx.stroke();
-    }
+function drawBullet(context, bullet) {
+  context.save();
+  context.shadowColor = '#ffc45c';
+  context.shadowBlur = 10;
+  context.fillStyle = '#ffd37a';
+  context.beginPath();
+  context.arc(bullet.x, bullet.y, BULLET_RADIUS, 0, Math.PI * 2);
+  context.fill();
+  context.restore();
+}
 
-    function drawShieldRing() {
-      // core
-      const coreG = ctx.createRadialGradient(0,0,2, 0,0,16);
-      coreG.addColorStop(0, 'rgba(0,251,255,0.95)'); coreG.addColorStop(1, 'rgba(0,191,255,0.15)');
-      ctx.fillStyle = coreG; ctx.beginPath(); ctx.arc(0,0,6 * pulse, 0, Math.PI * 2); ctx.fill();
-      // outer ring
-      ctx.strokeStyle = 'rgba(0,191,255,0.9)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(0,0,14 + Math.sin(tNow*6)*0.6, 0, Math.PI * 2); ctx.stroke();
-    }
+function drawItem(context, item) {
+  const colors = {
+    heal: '#e45757',
+    armor: '#58a6d9',
+    speed: '#d788e8',
+    rapid: '#f4b860',
+    shield: '#4dd6d6',
+    multi_shot: '#f08a4b'
+  };
+  const labels = { heal: '+', armor: 'A', speed: 'S', rapid: 'R', shield: 'O', multi_shot: '3' };
+  context.save();
+  context.translate(item.x, item.y);
+  context.fillStyle = colors[item.type] || '#ffffff';
+  context.beginPath();
+  context.arc(0, 0, 11, 0, Math.PI * 2);
+  context.fill();
+  context.fillStyle = '#101515';
+  context.font = '700 12px Inter, sans-serif';
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.fillText(labels[item.type] || '?', 0, 1);
+  context.restore();
+}
 
-    function drawMulti() {
-      ctx.fillStyle = '#f39c12';
-      for (let i = -1; i <= 1; i++) {
-        ctx.beginPath(); ctx.moveTo(i*6 - 2, -4); ctx.lineTo(i*6 + 4, 0); ctx.lineTo(i*6 - 2, 6); ctx.closePath(); ctx.fill();
-      }
-    }
+function drawTank(context, player, isLocal) {
+  const centerX = player.x + player.w / 2;
+  const centerY = player.y + player.h / 2;
+  const bodyColor = player.dead ? '#555b58' : isLocal ? '#f2c14e' : '#50a878';
+  const turretColor = player.dead ? '#454a47' : isLocal ? '#d99b24' : '#2f7855';
 
-    // pick renderer
-    switch (it.type) {
-      case 'heal': drawHeart(); break;
-      case 'armor': drawShieldIcon(); break;
-      case 'speed': drawLightning(); break;
-      case 'rapid': drawBullet(); break;
-      case 'shield': drawShieldRing(); break;
-      case 'multi_shot': drawMulti(); break;
-      default: drawMulti(); break;
-    }
+  context.save();
+  context.translate(centerX, centerY);
+  context.globalAlpha = player.hidden && isLocal ? 0.45 : 1;
+  context.rotate(player.bodyAngle || 0);
+  context.fillStyle = '#202725';
+  context.fillRect(-18, -15, 36, 8);
+  context.fillRect(-18, 7, 36, 8);
+  context.fillStyle = bodyColor;
+  context.fillRect(-14, -11, 28, 22);
+  context.strokeStyle = '#111715';
+  context.lineWidth = 2;
+  context.strokeRect(-14, -11, 28, 22);
+  context.restore();
 
-    // subtle halo
-    ctx.shadowBlur = 0;
-    ctx.globalAlpha = 0.9;
-    ctx.restore();
-  });
+  context.save();
+  context.translate(centerX, centerY);
+  context.rotate(player.turretAngle || 0);
+  context.fillStyle = '#9aa3a0';
+  context.fillRect(0, -3, 23, 6);
+  context.fillStyle = turretColor;
+  context.beginPath();
+  context.arc(0, 0, 10, 0, Math.PI * 2);
+  context.fill();
+  context.restore();
 
-  // Vẽ Đạn (Dạng tia lửa cho hiện đại)
-  (state.bullets || []).forEach(b => {
-    ctx.fillStyle = '#f39c12';
-    ctx.shadowBlur = 5;
-    ctx.shadowColor = '#f1c40f';
-    ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, Math.PI * 2); ctx.fill();
-    ctx.shadowBlur = 0;
-  });
+  if (player.shieldActive) {
+    context.strokeStyle = '#50d8e8';
+    context.lineWidth = 3;
+    context.beginPath();
+    context.arc(centerX, centerY, 25, 0, Math.PI * 2);
+    context.stroke();
+  }
 
-  // Vẽ Người chơi
-  (state.players || []).forEach(p => {
-    drawTank(p);
+  drawStatusBars(context, player);
+  context.font = isLocal ? '700 11px Inter, sans-serif' : '600 11px Inter, sans-serif';
+  context.textAlign = 'center';
+  context.fillStyle = isLocal ? '#ffd66b' : '#ffffff';
+  context.fillText(
+    isLocal ? `YOU - ${player.username}` : player.username,
+    centerX,
+    player.y + player.h + 17
+  );
 
-    // Shield effect
-    if (p.shieldActive) {
-        ctx.strokeStyle = '#00fbff';
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.arc(p.x + 16, p.y + 16, 25, 0, Math.PI * 2);
-        ctx.stroke();
-    }
+  if (isLocal) {
+    context.fillStyle = '#ffd66b';
+    context.beginPath();
+    context.moveTo(centerX, player.y - 17);
+    context.lineTo(centerX - 6, player.y - 26);
+    context.lineTo(centerX + 6, player.y - 26);
+    context.closePath();
+    context.fill();
+  }
+}
 
-    // UI (HP & Armor)
-    const barW = 32;
-    // Armor bar
-    ctx.fillStyle = '#bdc3c7';
-    ctx.fillRect(p.x, p.y - 12, barW * (p.armor / 100), 4);
-    // HP bar
-    ctx.fillStyle = '#e74c3c';
-    ctx.fillRect(p.x, p.y - 7, barW * (p.hp / 100), 5);
-
-    // Name tag
-    ctx.fillStyle = '#fff';
-    ctx.font = '12px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText(p.username, p.x + 16, p.y + 45);
-  });
+function drawStatusBars(context, player) {
+  const width = player.w;
+  context.fillStyle = 'rgba(0,0,0,0.55)';
+  context.fillRect(player.x, player.y - 12, width, 4);
+  context.fillRect(player.x, player.y - 6, width, 5);
+  context.fillStyle = '#84b9d6';
+  context.fillRect(player.x, player.y - 12, width * (player.armor / MAX_ARMOR), 4);
+  context.fillStyle = player.hp > 35 ? '#62bf6e' : '#e75b52';
+  context.fillRect(player.x, player.y - 6, width * (player.hp / TANK_HP), 5);
 }
