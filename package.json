@@ -13,9 +13,9 @@
   "scripts": {
     "dev:backend": "npm run dev --workspace backend",
     "dev:frontend": "npm run dev --workspace frontend",
-    "format": "prettier --write backend/src backend/scripts backend/test backend/setup-db.js frontend/src frontend/index.html shared eslint.config.mjs package.json backend/package.json frontend/package.json",
-    "format:check": "prettier --check backend/src backend/scripts backend/test backend/setup-db.js frontend/src frontend/index.html shared eslint.config.mjs package.json backend/package.json frontend/package.json",
-    "lint": "eslint backend/src backend/scripts backend/test backend/setup-db.js frontend/src shared eslint.config.mjs",
+    "format": "prettier --write backend/src backend/scripts backend/test backend/setup-db.js frontend/src frontend/index.html frontend/vite.config.mjs shared eslint.config.mjs package.json backend/package.json frontend/package.json",
+    "format:check": "prettier --check backend/src backend/scripts backend/test backend/setup-db.js frontend/src frontend/index.html frontend/vite.config.mjs shared eslint.config.mjs package.json backend/package.json frontend/package.json",
+    "lint": "eslint backend/src backend/scripts backend/test backend/setup-db.js frontend/src frontend/vite.config.mjs shared eslint.config.mjs",
     "rebuild:ranking": "npm run rebuild:ranking --workspace backend",
     "test": "npm test --workspace backend",
     "build": "npm run build --workspace frontend",

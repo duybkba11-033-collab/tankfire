@@ -83,9 +83,10 @@ export default defineConfig([
     }
   },
   {
-    files: ['shared/**/*.mjs', 'eslint.config.mjs'],
+    files: ['shared/**/*.mjs', 'eslint.config.mjs', 'frontend/vite.config.mjs'],
     languageOptions: {
       ecmaVersion: 'latest',
+      globals: nodeGlobals,
       sourceType: 'module'
     },
     rules: js.configs.recommended.rules

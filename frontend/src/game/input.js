@@ -39,8 +39,10 @@ export function initInput(canvas) {
   window.addEventListener('blur', resetInput);
   canvas.addEventListener('pointermove', (event) => {
     const bounds = canvas.getBoundingClientRect();
-    pointer.mouseX = (event.clientX - bounds.left) * (canvas.width / bounds.width);
-    pointer.mouseY = (event.clientY - bounds.top) * (canvas.height / bounds.height);
+    const logicalWidth = Number(canvas.dataset.logicalWidth) || canvas.width;
+    const logicalHeight = Number(canvas.dataset.logicalHeight) || canvas.height;
+    pointer.mouseX = (event.clientX - bounds.left) * (logicalWidth / bounds.width);
+    pointer.mouseY = (event.clientY - bounds.top) * (logicalHeight / bounds.height);
   });
 }
 
